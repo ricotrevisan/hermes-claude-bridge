@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['20', '22', 'lts/*']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+    # NOTE: the installer (bin/install.mjs) mutates ~/.hermes and registers an OS
+    # service, and end-to-end turns need a logged-in Claude Code subscription —
+    # neither runs in CI. Only the pure unit tests + build run here.
