@@ -30,6 +30,9 @@ const LABEL = "com.ricotrevisan.hermes-claude-bridge";
 const DEFAULT_PORT = "8787";
 const ENV_KEY = "CLAUDE_BRIDGE_API_KEY";
 const ENV_VALUE = "claude-code-subscription";
+const DEPRECATION_MESSAGE =
+	"hermes-claude-bridge is deprecated and install is disabled. " +
+	"Use Hermes' native Anthropic provider for API-key usage, or the Hermes claude-code skill for Claude Code delegation.";
 
 function parseArgs(argv) {
 	const args = { port: process.env.CLAUDE_BRIDGE_PORT || DEFAULT_PORT, link: false, service: true };
@@ -299,6 +302,10 @@ async function healthCheck(port, attempts = 40) {
 }
 
 export async function install(argv) {
+	if (!argv.includes("--force-deprecated-install")) {
+		throw new Error(`${DEPRECATION_MESSAGE} Existing installs can be removed with: hermes-claude-bridge uninstall. To override, pass --force-deprecated-install.`);
+	}
+
 	if (platform() === "win32") {
 		throw new Error(
 			"Windows is not supported yet — use WSL. (You can still run the bridge manually with " +
@@ -311,7 +318,7 @@ export async function install(argv) {
 	const home = hermesHome();
 
 	// Transparency: state what will change before mutating anything.
-	console.log(`hermes-claude-bridge install — this will:
+	console.log(`hermes-claude-bridge install — DEPRECATED OVERRIDE — this will:
   • copy the bridge server to ${stableRuntimeDir()}
   • write a provider plugin to ${join(home, "plugins", "model-providers", "claude-bridge")}
   • add a placeholder ${ENV_KEY} to ${join(home, ".env")} (the bridge ignores its value)

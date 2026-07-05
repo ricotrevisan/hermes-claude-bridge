@@ -1,8 +1,18 @@
-# hermes-claude-bridge
+# hermes-claude-bridge — DEPRECATED
 
-Use **Claude** — powered by your **Claude Code Pro/Max subscription** — as a model
-provider for the [Hermes agent](https://github.com/NousResearch/hermes-agent).
-**No `ANTHROPIC_API_KEY` required.** Ported/adapted from
+> **Deprecated / not recommended.** This bridge is no longer maintained. In its
+> default mode it exposes Claude Code as a plain text model with no tools; if
+> tool use is enabled, it overlaps with Hermes' `claude-code` skill while hiding
+> agentic file/shell access behind a model-provider selection. Use Hermes' native
+> Anthropic provider for API-key usage, or Hermes' `claude-code` skill when you
+> intentionally want Claude Code delegation.
+>
+> Existing local installs can be removed with `hermes-claude-bridge uninstall`.
+
+Historically, this package used **Claude** — powered by your **Claude Code
+Pro/Max subscription** — as a model provider for the
+[Hermes agent](https://github.com/NousResearch/hermes-agent). **No
+`ANTHROPIC_API_KEY` required.** Ported/adapted from
 [`pi-claude-bridge`](https://github.com/elidickinson/pi-claude-bridge) (the same
 idea for the Pi agent).
 
@@ -39,42 +49,14 @@ nothing itself.
 
 ## Install
 
+Installation is disabled by default because this package is deprecated.
+
 ```bash
 npx hermes-claude-bridge install
+# → fails with a deprecation message
 ```
 
-This (it prints exactly what it will change first):
-
-1. Copies the self-contained bridge server to `~/.hermes/claude-bridge/` (a stable
-   location, so the background service never depends on an npx cache).
-2. Writes the Hermes provider plugin to `~/.hermes/plugins/model-providers/claude-bridge/`.
-3. Adds a placeholder `CLAUDE_BRIDGE_API_KEY` to `~/.hermes/.env` and a
-   `providers.claude-bridge` entry to `~/.hermes/config.yaml` (see
-   [What it changes](#what-the-installer-changes)).
-4. Registers a background **auto-start service** running the stable server copy:
-   - **macOS** — a `launchd` user agent (`RunAtLoad` + `KeepAlive`), logging to
-     `~/.hermes/logs/claude-bridge.log`.
-   - **Linux** — a `systemd --user` unit. Run `loginctl enable-linger $USER` once
-     to start it before login.
-
-Then, in Hermes:
-
-```bash
-hermes model     # pick 'claude-bridge', then pick a model (e.g. claude-opus-4-8)
-```
-
-That's it — turns now run on your Claude Code subscription. (If a Hermes session
-is already open, restart it so it re-reads `config.yaml`. You must pick a specific
-model — the bridge advertises three and Hermes only auto-picks when an endpoint
-exposes exactly one.)
-
-### Options
-
-```bash
-npx hermes-claude-bridge install --port 9000   # bind a different port (baked into the plugin + service)
-npx hermes-claude-bridge install --no-service  # skip the service; run it yourself with 'hermes-claude-bridge start'
-npx hermes-claude-bridge install --link        # symlink the repo's plugin/ dir (dev workflow)
-```
+Historical installs can still be removed:
 
 ### Uninstall
 
@@ -163,10 +145,10 @@ npm run build     # type-check (tsc --noEmit) + esbuild bundle → dist/server.j
 npm run dev       # run the bridge from source via tsx (no build step)
 ```
 
-Symlink workflow (edit the repo, no copy):
+Historical symlink workflow (only if deliberately overriding deprecation):
 
 ```bash
-npx hermes-claude-bridge install --link --no-service
+npx hermes-claude-bridge install --force-deprecated-install --link --no-service
 export CLAUDE_BRIDGE_PORT=8787   # in the same shell as both the bridge and hermes
 npm run dev
 ```
@@ -190,16 +172,18 @@ curl localhost:8787/v1/chat/completions -H 'Content-Type: application/json' \
   This comes from Claude, not the bridge. Verify with `claude -p "hi"` directly: if
   that also fails, wait for your window to reset (the bridge uses the same path).
 - **`Could not run the Claude Code CLI`** — `claude` isn't on the service's `PATH`.
-  Ensure Claude Code is installed/logged in and re-run the installer, or set
-  `CLAUDE_BRIDGE_CLAUDE_BIN` to its absolute path.
-- **`Unknown provider 'claude-bridge'`** in the picker — the `config.yaml` entry is
-  missing; re-run the installer, then restart the Hermes session.
-- **Port already in use** — stop the other listener or install with `--port`. The
-  service self-heals once the port frees.
+  Existing installs can set `CLAUDE_BRIDGE_CLAUDE_BIN` to its absolute path. Fresh
+  installs are deprecated and disabled unless deliberately overridden.
+- **`Unknown provider 'claude-bridge'`** in the picker — the provider was removed
+  or never installed. Prefer another Hermes provider or the `claude-code` skill;
+  do not reinstall this bridge unless deliberately overriding deprecation.
+- **Port already in use** — stop the other listener. Historical installs can use
+  `--force-deprecated-install --port N` if deliberately overriding deprecation.
 - **Check the bridge** — `curl localhost:8787/healthz`, then read
   `~/.hermes/logs/claude-bridge.log`. `CLAUDE_BRIDGE_DEBUG=1` adds verbose tracing.
-- **Service stopped after upgrading the npm package** — re-run
-  `npx hermes-claude-bridge install` to refresh the stable runtime copy.
+- **Service stopped after upgrading the npm package** — prefer uninstalling this
+  deprecated bridge. Historical installs can be refreshed only by deliberately
+  overriding deprecation with `npx hermes-claude-bridge install --force-deprecated-install`.
 
 ---
 

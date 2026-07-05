@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // hermes-claude-bridge CLI: install | uninstall | start | help
 //
-// `npx hermes-claude-bridge install` sets up the Hermes plugin and a background
-// auto-start service. The service itself runs `node dist/server.js` — npx only
-// runs the one-shot installer, never the long-lived server.
+// Fresh installs are disabled by default because this package is deprecated.
+// `npx hermes-claude-bridge uninstall` removes historical installs. If someone
+// deliberately passes --force-deprecated-install, the service itself runs
+// `node dist/server.js` — npx only runs the one-shot installer, never the
+// long-lived server.
 
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -13,25 +15,26 @@ const cmd = process.argv[2];
 const rest = process.argv.slice(3);
 
 function help() {
-	console.log(`hermes-claude-bridge — Claude (Claude Code subscription) as a Hermes provider
+	console.log(`hermes-claude-bridge — DEPRECATED
+
+This bridge is no longer maintained. Use Hermes' native Anthropic provider for
+API-key usage, or Hermes' claude-code skill for explicit Claude Code delegation.
 
 Usage:
-  npx hermes-claude-bridge install [--port N] [--link] [--no-service]
   npx hermes-claude-bridge uninstall
+  npx hermes-claude-bridge install [--force-deprecated-install] [--port N] [--link] [--no-service]
   npx hermes-claude-bridge start [--port N]
 
 Commands:
-  install      Write the Hermes plugin and register a background auto-start service.
-  uninstall    Remove the plugin and the service.
-  start        Run the bridge server in the foreground (mainly for debugging).
+  uninstall    Remove the plugin and the service from an existing install.
+  install      Disabled unless --force-deprecated-install is passed.
+  start        Run the deprecated bridge server in the foreground (mainly for cleanup/debugging).
 
 Options:
-  --port N      Port to bind (default 8787, or $CLAUDE_BRIDGE_PORT).
-  --link        Symlink the repo's plugin/ dir instead of copying (dev workflow).
-  --no-service  Skip registering the launchd/systemd service (run via 'npm run dev').
-
-After installing: open Hermes, run 'hermes model', and pick 'claude-bridge'.
-Requires Claude Code to be logged in: run 'claude login' (Claude Pro/Max).`);
+  --force-deprecated-install  Override the deprecation guard and install anyway.
+  --port N                    Port to bind (default 8787, or $CLAUDE_BRIDGE_PORT).
+  --link                      Symlink the repo's plugin/ dir instead of copying (dev workflow).
+  --no-service                Skip registering the launchd/systemd service.`);
 }
 
 async function run(fn) {

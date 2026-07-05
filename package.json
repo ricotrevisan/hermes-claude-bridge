@@ -1,7 +1,7 @@
 {
   "name": "hermes-claude-bridge",
   "version": "0.1.0",
-  "description": "Use Claude (via a Claude Code Pro/Max subscription) as a model provider for the Hermes agent — no ANTHROPIC_API_KEY. A local OpenAI-compatible bridge that drives the `claude -p` CLI.",
+  "description": "DEPRECATED: Claude Code as a Hermes model provider overlaps with Hermes' claude-code skill and is no longer maintained.",
   "keywords": [
     "hermes",
     "hermes-agent",
