@@ -31,8 +31,10 @@ export function mapStopReason(reason: string | null | undefined): OpenAIFinishRe
 	switch (reason) {
 		case "max_tokens":
 			return "length";
+		// Hermes tool-call deltas are not bridged yet. Advertising tool_calls
+		// without a corresponding call would leave the client waiting forever.
 		case "tool_use":
-			return "tool_calls";
+			return "stop";
 		case "end_turn":
 		case "stop_sequence":
 		default:

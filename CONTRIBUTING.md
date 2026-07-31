@@ -21,11 +21,14 @@ end-to-end path.
 - **Tests:** the conversion (`src/convert.ts`) and SSE-framing (`src/openai.ts`)
   layers are unit-tested with the Node test runner. Add a failing test before
   fixing a bug or adding behavior, and keep `npm test` green.
-- The `claude -p` driver (`src/bridge.ts`) and the HTTP edge (`src/server.ts`)
-  are integration-tested manually against a live subscription — describe how you
-  verified changes there in the PR.
-- Keep the bridge on the **subscription** entrypoint (`claude -p`); don't
-  reintroduce the Agent SDK `query()` path (it meters as overage).
+- The Agent SDK driver (`src/bridge.ts`) is tested offline through its injected
+  `queryFn` seam. The HTTP edge can also be smoke-tested manually against a live
+  subscription; describe any live verification in the PR.
+- Keep authentication subscription-only: strip Anthropic API-key/base-URL
+  variables from the child environment, require first-party subscription account
+  metadata, and reject explicit SDK API-key credential sources.
+- Pin and deliberately test Agent SDK upgrades. Its bundled Claude Code runtime,
+  message shapes, and subscription entitlement can change independently.
 - The installer mutates `~/.hermes` and registers an OS service — never run it in
   CI, and keep all changes reversible by `uninstall`.
 - Match the existing code style (tabs, the surrounding patterns).

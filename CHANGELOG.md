@@ -6,9 +6,21 @@ All notable changes to this project are documented here. The format is based on
 
 ## Unreleased
 
-- Deprecated the project and disabled fresh installs by default. Existing users
-  should uninstall with `hermes-claude-bridge uninstall` and use Hermes' native
-  Anthropic provider or `claude-code` skill instead.
+## [0.2.0] - 2026-07-30
+
+- Revived the bridge using Claude Agent SDK `query()` now that Agent SDK turns
+  can use Claude subscription quota again.
+- Enforced subscription-only execution per query so ambient Anthropic API keys
+  or an SDK-selected Extra Usage lane cannot silently switch turns to metered billing.
+- Kept the official Claude Code system-prompt preset as a tested subscription-routing
+  boundary and excluded the outer Hermes harness system prompt, which selects Extra Usage.
+- Added current Claude Code models, measured subscription-compatible context routing,
+  served-context drift warnings, SDK stream/error handling, abort cleanup, isolated child
+  settings, browser-origin request hardening, and offline transport tests.
+- Updated installation to provision the pinned Agent SDK and its platform-native
+  Claude Code runtime beside the stable bridge service.
+- Deliberately deferred Hermes tool passthrough ([#1](https://github.com/ricotrevisan/hermes-claude-bridge/issues/1)):
+  default mode is a clean conversational provider, while optional full-agent mode uses Claude Code's own tools.
 
 ## [0.1.0] - 2026-06-24
 

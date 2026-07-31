@@ -1,11 +1,5 @@
 #!/usr/bin/env node
 // hermes-claude-bridge CLI: install | uninstall | start | help
-//
-// Fresh installs are disabled by default because this package is deprecated.
-// `npx hermes-claude-bridge uninstall` removes historical installs. If someone
-// deliberately passes --force-deprecated-install, the service itself runs
-// `node dist/server.js` — npx only runs the one-shot installer, never the
-// long-lived server.
 
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -15,26 +9,25 @@ const cmd = process.argv[2];
 const rest = process.argv.slice(3);
 
 function help() {
-	console.log(`hermes-claude-bridge — DEPRECATED
+	console.log(`hermes-claude-bridge
 
-This bridge is no longer maintained. Use Hermes' native Anthropic provider for
-API-key usage, or Hermes' claude-code skill for explicit Claude Code delegation.
+Use Claude models from Hermes through the Claude Agent SDK and your Claude
+subscription OAuth login. The bridge exposes a localhost OpenAI-compatible API.
 
 Usage:
+  npx hermes-claude-bridge install [--port N] [--link] [--no-service]
   npx hermes-claude-bridge uninstall
-  npx hermes-claude-bridge install [--force-deprecated-install] [--port N] [--link] [--no-service]
   npx hermes-claude-bridge start [--port N]
 
 Commands:
-  uninstall    Remove the plugin and the service from an existing install.
-  install      Disabled unless --force-deprecated-install is passed.
-  start        Run the deprecated bridge server in the foreground (mainly for cleanup/debugging).
+  install      Install the Hermes provider, stable SDK runtime, and optional service.
+  uninstall    Remove the provider, runtime, and service.
+  start        Run the bridge server in the foreground.
 
 Options:
-  --force-deprecated-install  Override the deprecation guard and install anyway.
-  --port N                    Port to bind (default 8787, or $CLAUDE_BRIDGE_PORT).
-  --link                      Symlink the repo's plugin/ dir instead of copying (dev workflow).
-  --no-service                Skip registering the launchd/systemd service.`);
+  --port N      Port to bind (default 8787, or $CLAUDE_BRIDGE_PORT).
+  --link        Symlink the repo's plugin/ dir instead of copying (dev workflow).
+  --no-service  Skip registering the launchd/systemd service.`);
 }
 
 async function run(fn) {

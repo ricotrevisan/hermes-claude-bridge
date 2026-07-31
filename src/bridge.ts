@@ -1,50 +1,32 @@
-// Claude Code driver for the bridge.
+// Claude Agent SDK driver for the bridge.
 //
-// Ported/adapted from pi-claude-bridge (https://github.com/elidickinson/pi-claude-bridge,
-// MIT, Copyright (c) 2026 Eli Dickinson). See NOTICE.
-//
-// CRITICAL: this drives the user's installed `claude` CLI in print mode
-// (`claude -p`), NOT the Claude Agent SDK's query(). The Agent SDK spawns its
-// own bundled CLI tagged CLAUDE_CODE_ENTRYPOINT=sdk-ts, which Anthropic meters
-// as SDK/API usage (it draws "extra usage"/overage, not your subscription
-// allowance). The standalone `claude -p` (and `acp`) is the entrypoint
-// Anthropic allows to run on the Claude Code Pro/Max subscription. So we shell
-// out to it and parse its --output-format stream-json events.
-//
-// Thin-client model: Claude Code runs its OWN tools; we only stream text/
-// reasoning back. We replay inbound OpenAI history into a cc-session-io session
-// and `--resume` it; the trailing user turn is piped in as a stream-json user
-// message (text or image blocks).
+// Inbound OpenAI history is replayed through a temporary cc-session-io session,
+// while the trailing user turn is sent to the SDK as streaming input. The SDK's
+// query is deliberately isolated from API-key auth, local settings, MCP, hooks,
+// and skills. Full-agent mode changes only the system/tool/permission preset.
 
-import { spawn } from "node:child_process";
+import {
+	query as sdkQuery,
+	type EffortLevel,
+	type Options as ClaudeQueryOptions,
+	type Query,
+	type SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
 import { splitConversation, type OpenAIMessage } from "./convert.js";
+import { expectedContextWindow } from "./models.js";
 import type { AnthropicUsage } from "./openai.js";
 
-// The user's installed Claude Code CLI (the subscription entrypoint). Override
-// with CLAUDE_BRIDGE_CLAUDE_BIN if it isn't on PATH.
-const CLAUDE_BIN = process.env.CLAUDE_BRIDGE_CLAUDE_BIN || "claude";
-
-// By default the bridge presents Claude as a CLEAN conversational assistant:
-// no tools, no MCP servers, no hooks, and a replaced system prompt. This avoids
-// inheriting the user's full Claude Code setup (skills/auto-memory/hooks/MCP),
-// which otherwise leaks side-actions and tool narration into chat answers.
-// Set CLAUDE_BRIDGE_FULL_AGENT=1 to instead run Claude with the user's complete
-// config and its own tools (more capable, but verbose and prone to side-actions).
-const FULL_AGENT = process.env.CLAUDE_BRIDGE_FULL_AGENT === "1";
-const DEFAULT_SYSTEM_PROMPT = "You are a helpful, concise assistant.";
-
-// In full-agent mode, interactive tools can't work in a headless `-p` run —
-// block them so the model never stalls.
 const DISALLOWED_TOOLS = ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"];
 
-const REASONING_TO_EFFORT: Record<string, string> = {
+const REASONING_TO_EFFORT: Record<string, EffortLevel> = {
 	minimal: "low",
 	low: "low",
 	medium: "medium",
 	high: "high",
-	xhigh: "max",
+	xhigh: "xhigh",
 	max: "max",
+	ultra: "max",
 };
 
 export type BridgeEvent =
@@ -52,23 +34,16 @@ export type BridgeEvent =
 	| { type: "reasoning"; delta: string }
 	| { type: "usage"; usage: AnthropicUsage }
 	| { type: "done"; stopReason: string | null }
-	| { type: "error"; message: string; status?: string };
+	| { type: "error"; message: string; status?: string; httpStatus?: number };
 
 export type RunOptions = {
 	model: string;
 	reasoning?: string;
 	cwd?: string;
 	signal?: AbortSignal;
-	appendSystem?: boolean;
+	/** Test/offline seam. Production callers use the SDK's query(). */
+	queryFn?: typeof sdkQuery;
 };
-
-/** Remove API-key env vars so the CLI uses the Claude Code subscription, not a
- *  metered API key. Call once at startup. */
-export function forceSubscriptionAuth(): void {
-	delete process.env.ANTHROPIC_API_KEY;
-	delete process.env.ANTHROPIC_AUTH_TOKEN;
-	delete process.env.ANTHROPIC_BASE_URL;
-}
 
 function isAuthError(message: string, status?: string): boolean {
 	if (status === "authentication_failed") return true;
@@ -77,16 +52,16 @@ function isAuthError(message: string, status?: string): boolean {
 
 /** A friendlier message for the most common operational failures. */
 export function describeError(message: string, status?: string): string {
-	if (/ENOENT|not found|spawn .* ENOENT/i.test(message)) {
+	if (/\bENOENT\b|spawn[^\n]*not found/i.test(message)) {
+		const executable = process.env.CLAUDE_BRIDGE_CLAUDE_BIN || "the bundled Claude Code executable";
 		return (
-			`Could not run the Claude Code CLI ('${CLAUDE_BIN}'). Install it and ensure it's on PATH ` +
-			`(or set CLAUDE_BRIDGE_CLAUDE_BIN). The bridge drives 'claude -p' to use your subscription. ` +
-			`(underlying error: ${message})`
+			`Could not run Claude Code ('${executable}'). Install Claude Code or unset/fix ` +
+			`CLAUDE_BRIDGE_CLAUDE_BIN. (underlying error: ${message})`
 		);
 	}
 	if (isAuthError(message, status)) {
 		return (
-			"Claude Code is not authenticated. The bridge uses your Claude Code subscription, " +
+			"Claude Code is not authenticated with OAuth. The bridge requires your Claude Code subscription, " +
 			"so you must be logged in: run `claude login` (Claude Pro/Max). " +
 			`(underlying error: ${message})`
 		);
@@ -94,215 +69,359 @@ export function describeError(message: string, status?: string): string {
 	return message;
 }
 
-function mergeUsage(acc: AnthropicUsage, u: any): AnthropicUsage {
-	if (!u) return acc;
+function childEnvironment(): NodeJS.ProcessEnv {
+	const env = { ...process.env };
+	delete env.ANTHROPIC_API_KEY;
+	delete env.ANTHROPIC_AUTH_TOKEN;
+	delete env.ANTHROPIC_TOKEN;
+	delete env.ANTHROPIC_BASE_URL;
+	env.ENABLE_CLAUDEAI_MCP_SERVERS = "0";
+	env.DISABLE_AUTO_COMPACT = "1";
+	env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+	env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+	return env;
+}
+
+function usageFrom(value: any): AnthropicUsage {
+	const usage: AnthropicUsage = {};
+	for (const key of [
+		"input_tokens",
+		"output_tokens",
+		"cache_read_input_tokens",
+		"cache_creation_input_tokens",
+	] as const) {
+		if (typeof value?.[key] === "number") usage[key] = value[key];
+	}
+	return usage;
+}
+
+function mergeUsage(acc: AnthropicUsage, value: any): AnthropicUsage {
+	return { ...acc, ...usageFrom(value) };
+}
+
+export function servedContextWindow(modelUsage: unknown, requestedModel: string): number | undefined {
+	if (!modelUsage || typeof modelUsage !== "object") return undefined;
+	const baseModel = requestedModel.replace(/\[1m\]$/i, "");
+	for (const [model, usage] of Object.entries(modelUsage as Record<string, unknown>)) {
+		if (model !== baseModel && !model.startsWith(`${baseModel}-`)) continue;
+		const context = (usage as { contextWindow?: unknown })?.contextWindow;
+		if (typeof context === "number" && context > 0) return context;
+	}
+	return undefined;
+}
+
+function warnOnContextMismatch(message: any, requestedModel: string): void {
+	const served = servedContextWindow(message?.modelUsage, requestedModel);
+	if (!served) return;
+	const expected = expectedContextWindow(requestedModel);
+	if (served !== expected) {
+		console.warn(
+			`hermes-claude-bridge: ${requestedModel} served a ${served}-token context window; expected ${expected}. ` +
+				"Update the measured model catalog before relying on Hermes compaction thresholds.",
+		);
+	}
+}
+
+function assistantText(message: any): string {
+	if (!Array.isArray(message?.message?.content)) return "";
+	return message.message.content
+		.filter((block: any) => block?.type === "text" && typeof block.text === "string")
+		.map((block: any) => block.text)
+		.join("");
+}
+
+function errorEvent(message: string, status?: string, httpStatus?: number | null): BridgeEvent {
+	// Claude can reject an overage fallback as an ordinary API 400 before it
+	// emits rate_limit_info. Preserve the billing meaning so Hermes does not
+	// retry a request that cannot run against the available subscription quota.
+	if (/\bout of extra usage\b|\bextra usage\b[^.\n]*(?:unavailable|exhausted|disabled)/i.test(message)) {
+		status = "overage";
+		httpStatus = 402;
+	}
 	return {
-		input_tokens: u.input_tokens ?? acc.input_tokens,
-		output_tokens: u.output_tokens ?? acc.output_tokens,
-		cache_read_input_tokens: u.cache_read_input_tokens ?? acc.cache_read_input_tokens,
-		cache_creation_input_tokens: u.cache_creation_input_tokens ?? acc.cache_creation_input_tokens,
+		type: "error",
+		message,
+		...(status ? { status } : {}),
+		...(typeof httpStatus === "number" ? { httpStatus } : {}),
 	};
 }
 
+function resultError(message: any): BridgeEvent | null {
+	if (message.type !== "result") return null;
+	if (message.subtype === "success" && !message.is_error) return null;
+
+	const errors = Array.isArray(message.errors) ? message.errors.filter(Boolean).join("; ") : "";
+	const text = errors || (typeof message.result === "string" && message.result) || message.subtype || "error_during_execution";
+	const status = message.subtype === "success" ? "error_during_execution" : message.subtype;
+	return errorEvent(text, status, message.api_error_status);
+}
+
+function queryOptions(
+	cwd: string,
+	resume: string | undefined,
+	opts: RunOptions,
+): ClaudeQueryOptions {
+	const fullAgent = process.env.CLAUDE_BRIDGE_FULL_AGENT === "1";
+	const effort = opts.reasoning ? REASONING_TO_EFFORT[opts.reasoning.toLowerCase()] : undefined;
+	const executable = process.env.CLAUDE_BRIDGE_CLAUDE_BIN;
+
+	const common: ClaudeQueryOptions = {
+		cwd,
+		model: opts.model,
+		includePartialMessages: true,
+		env: childEnvironment(),
+		mcpServers: {},
+		strictMcpConfig: true,
+		settingSources: [],
+		skills: [],
+		hooks: {},
+		settings: { disableAllHooks: true },
+		...(effort ? { effort } : {}),
+		...(resume ? { resume } : { persistSession: false }),
+		...(executable ? { pathToClaudeCodeExecutable: executable } : {}),
+	};
+
+	if (fullAgent) {
+		return {
+			...common,
+			tools: { type: "preset", preset: "claude_code" },
+			permissionMode: "bypassPermissions",
+			allowDangerouslySkipPermissions: true,
+			disallowedTools: DISALLOWED_TOOLS,
+			systemPrompt: { type: "preset", preset: "claude_code" },
+		};
+	}
+
+	return {
+		...common,
+		tools: [],
+		maxTurns: 1,
+		// The official preset without the outer Hermes harness prompt is
+		// load-bearing for Claude subscription routing. Forwarding that full
+		// system prompt was observed to select Extra Usage instead.
+		systemPrompt: { type: "preset", preset: "claude_code" },
+	};
+}
+
+function livePrompt(content: unknown): AsyncIterable<SDKUserMessage> {
+	return (async function* () {
+		yield {
+			type: "user",
+			message: { role: "user", content } as SDKUserMessage["message"],
+			parent_tool_use_id: null,
+		};
+	})();
+}
+
 /**
- * Drive a single Claude Code print-mode turn and yield normalized events.
- * Always ends with a `usage` event then a `done` event — unless it yields an
- * `error` event first.
+ * Drive one Claude Agent SDK turn and yield normalized bridge events.
+ * Successful queries end with usage and done; failures end with error.
  */
 export async function* runClaude(
 	messages: OpenAIMessage[],
 	opts: RunOptions,
 ): AsyncGenerator<BridgeEvent> {
 	const cwd = opts.cwd || process.env.CLAUDE_BRIDGE_CWD || process.cwd();
-	const { system, history, promptText, promptBlocks } = splitConversation(messages);
-
-	// Replay prior turns into a resumable session (if any).
+	const { history, promptText, promptBlocks } = splitConversation(messages);
 	let session: ReturnType<typeof createSession> | null = null;
-	let resumeSessionId: string | undefined;
-	if (history.length > 0) {
-		session = createSession({ projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR, model: opts.model });
-		session.importMessages(repairToolPairing(history));
-		session.save();
-		resumeSessionId = session.sessionId;
-	}
-
-	const args = [
-		"-p",
-		"--output-format", "stream-json",
-		"--input-format", "stream-json",
-		"--verbose",
-		"--include-partial-messages",
-		"--model", opts.model,
-	];
-	const effort = opts.reasoning ? REASONING_TO_EFFORT[opts.reasoning.toLowerCase()] : undefined;
-	if (effort) args.push("--effort", effort);
-	if (resumeSessionId) args.push("--resume", resumeSessionId);
-
-	if (FULL_AGENT) {
-		// Inherit the user's full Claude Code config; Claude runs its own tools.
-		args.push("--permission-mode", "bypassPermissions", "--disallowed-tools", ...DISALLOWED_TOOLS);
-		if (opts.appendSystem !== false && system) args.push("--append-system-prompt", system);
-	} else {
-		// Clean assistant: replace the system prompt, drop MCP + hooks, no tools.
-		args.push("--strict-mcp-config");
-		args.push("--settings", '{"disableAllHooks":true}');
-		args.push("--system-prompt", opts.appendSystem !== false && system ? system : DEFAULT_SYSTEM_PROMPT);
-		args.push("--tools", ""); // variadic — keep last so it consumes only the empty value
-	}
-
-	const userMessage = {
-		type: "user",
-		message: { role: "user", content: promptBlocks ?? (promptText || "[continue]") },
-	};
-
-	const child = spawn(CLAUDE_BIN, args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
-
-	let spawnError: Error | null = null;
-	child.on("error", (e) => {
-		spawnError = e;
-	});
-	let stderr = "";
-	child.stderr.on("data", (d) => {
-		stderr += d.toString();
-		if (stderr.length > 8192) stderr = stderr.slice(-8192);
-	});
-
-	const onAbort = () => {
-		try {
-			child.kill("SIGTERM");
-		} catch {
-			/* ignore */
-		}
-	};
-	if (opts.signal) {
-		if (opts.signal.aborted) onAbort();
-		else opts.signal.addEventListener("abort", onAbort, { once: true });
-	}
-
-	// Send the live user turn, then close stdin so the CLI processes and exits.
-	try {
-		child.stdin.write(JSON.stringify(userMessage) + "\n");
-		child.stdin.end();
-	} catch {
-		/* child may have failed to spawn; handled below */
-	}
-
+	let activeQuery: Query | null = null;
+	let aborted = opts.signal?.aborted ?? false;
+	let failed = false;
+	let subscriptionAccount = false;
+	let authenticated = false;
 	let sawText = false;
 	let stopReason: string | null = null;
-	let finalUsage: AnthropicUsage = {};
-	let emittedError = false;
-	let buffer = "";
+	let streamedUsage: AnthropicUsage = {};
+	let authoritativeUsage: AnthropicUsage | null = null;
 
-	// Parse one JSONL message; returns events to yield (so the loop stays flat).
-	function handle(msg: any): BridgeEvent[] {
-		const out: BridgeEvent[] = [];
-		if (msg.type === "stream_event") {
-			const event = msg.event;
-			if (event?.type === "content_block_delta") {
-				const d = event.delta;
-				if (d?.type === "text_delta" && d.text) {
-					sawText = true;
-					out.push({ type: "text", delta: d.text });
-				} else if (d?.type === "thinking_delta" && d.thinking) {
-					out.push({ type: "reasoning", delta: d.thinking });
-				}
-			} else if (event?.type === "message_delta") {
-				if (event.delta?.stop_reason) stopReason = event.delta.stop_reason;
-				if (event.usage) finalUsage = mergeUsage(finalUsage, event.usage);
-			} else if (event?.type === "message_start" && event.message?.usage) {
-				finalUsage = mergeUsage(finalUsage, event.message.usage);
-			}
-		} else if (msg.type === "assistant") {
-			// Fallback only if streaming deltas produced no text.
-			if (!sawText && Array.isArray(msg.message?.content)) {
-				for (const block of msg.message.content) {
-					if (block.type === "text" && block.text) {
-						sawText = true;
-						out.push({ type: "text", delta: block.text });
-					}
-				}
-			}
-		} else if (msg.type === "result") {
-			if (msg.usage) finalUsage = mergeUsage(finalUsage, msg.usage);
-			if (msg.stop_reason) stopReason = msg.stop_reason;
-			if (msg.subtype === "success") {
-				if (!sawText && typeof msg.result === "string" && msg.result) {
-					out.push({ type: "text", delta: msg.result });
-				}
-			} else if (!sawText) {
-				const errs =
-					Array.isArray(msg.errors) && msg.errors.length
-						? msg.errors.join("; ")
-						: typeof msg.result === "string" && msg.result
-							? msg.result
-							: msg.subtype || "error_during_execution";
-				emittedError = true;
-				out.push({ type: "error", message: errs });
+	const onAbort = () => {
+		aborted = true;
+		if (activeQuery) {
+			void activeQuery.interrupt().catch(() => {});
+			try {
+				activeQuery.close();
+			} catch {
+				// Best effort; finally retries close.
 			}
 		}
-		// type:"system" (init/hook/status/thinking_tokens) and others: ignored.
-		return out;
-	}
+	};
+
+	if (opts.signal) opts.signal.addEventListener("abort", onAbort, { once: true });
 
 	try {
-		for await (const chunk of child.stdout as AsyncIterable<Buffer>) {
-			if (opts.signal?.aborted) break;
-			buffer += chunk.toString();
-			let nl: number;
-			while ((nl = buffer.indexOf("\n")) >= 0) {
-				const line = buffer.slice(0, nl);
-				buffer = buffer.slice(nl + 1);
-				if (!line.trim()) continue;
-				let msg: any;
-				try {
-					msg = JSON.parse(line);
-				} catch {
-					continue; // ignore non-JSON noise
-				}
-				for (const ev of handle(msg)) yield ev;
-			}
-		}
-		if (buffer.trim()) {
-			try {
-				for (const ev of handle(JSON.parse(buffer))) yield ev;
-			} catch {
-				/* ignore trailing partial */
-			}
+		let resumeSessionId: string | undefined;
+		if (history.length > 0) {
+			session = createSession({
+				projectPath: cwd,
+				claudeDir: process.env.CLAUDE_CONFIG_DIR,
+				model: opts.model,
+			});
+			session.importMessages(repairToolPairing(history));
+			session.save();
+			resumeSessionId = session.sessionId;
 		}
 
-		const code: number = await new Promise((res) => {
-			if (child.exitCode !== null) return res(child.exitCode);
-			child.on("close", (c) => res(c ?? 0));
+		if (aborted) return;
+
+		const content = promptBlocks ?? (promptText || "[continue]");
+		activeQuery = (opts.queryFn ?? sdkQuery)({
+			prompt: livePrompt(content),
+			options: queryOptions(cwd, resumeSessionId, opts),
 		});
 
-		if (spawnError) {
-			emittedError = true;
-			yield { type: "error", message: (spawnError as Error).message };
-		} else if (code !== 0 && !emittedError && !sawText && !opts.signal?.aborted) {
-			emittedError = true;
-			yield { type: "error", message: stderr.trim() || `claude exited with code ${code}` };
+		if (opts.signal?.aborted) onAbort();
+		if (aborted) return;
+
+		const account = await activeQuery.accountInfo();
+		subscriptionAccount = account.apiProvider === "firstParty" && Boolean(account.subscriptionType);
+		if (!subscriptionAccount) {
+			failed = true;
+			yield errorEvent(
+				"Claude Agent SDK did not report a first-party Claude subscription account; refusing non-subscription execution.",
+				"authentication_failed",
+			);
+			return;
 		}
-	} catch (err) {
-		emittedError = true;
-		yield { type: "error", message: err instanceof Error ? err.message : String(err) };
+
+		for await (const message of activeQuery) {
+			if (aborted) break;
+
+			if (message.type === "system" && message.subtype === "init") {
+				// Claude Code currently reports "none" for a valid Keychain-backed
+				// claude.ai login. Explicit API-key sources are never accepted.
+				const source = message.apiKeySource as string;
+				authenticated = subscriptionAccount && (source === "oauth" || source === "none");
+				if (!authenticated) {
+					failed = true;
+					yield errorEvent(
+						`Claude Agent SDK reported API-key source '${source}'; refusing non-subscription billing.`,
+						"authentication_failed",
+					);
+					break;
+				}
+				continue;
+			}
+
+			// The SDK emits init before any turn output. Refuse to forward or
+			// trigger further iteration until OAuth has been verified.
+			if (!authenticated) {
+				failed = true;
+				yield errorEvent("Claude Agent SDK did not initialize with OAuth authentication.", "authentication_failed");
+				break;
+			}
+
+			if (message.type === "stream_event") {
+				const event: any = message.event;
+				if (event?.type === "content_block_delta") {
+					const delta = event.delta;
+					if (delta?.type === "text_delta" && delta.text) {
+						sawText = true;
+						yield { type: "text", delta: delta.text };
+					} else if (delta?.type === "thinking_delta" && delta.thinking) {
+						yield { type: "reasoning", delta: delta.thinking };
+					}
+				} else if (event?.type === "message_start") {
+					streamedUsage = mergeUsage(streamedUsage, event.message?.usage);
+				} else if (event?.type === "message_delta") {
+					if (event.delta?.stop_reason) stopReason = event.delta.stop_reason;
+					streamedUsage = mergeUsage(streamedUsage, event.usage);
+				}
+				continue;
+			}
+
+			if (message.type === "assistant") {
+				if (message.error) {
+					failed = true;
+					yield errorEvent(assistantText(message) || message.error, message.error);
+					break;
+				}
+				if (!sawText) {
+					const text = assistantText(message);
+					if (text) {
+						sawText = true;
+						yield { type: "text", delta: text };
+					}
+				}
+				continue;
+			}
+
+			if (message.type === "rate_limit_event") {
+				if (message.rate_limit_info.isUsingOverage === true) {
+					failed = true;
+					yield errorEvent(
+						"Claude Agent SDK selected Extra Usage instead of subscription quota; refusing the turn.",
+						"overage",
+						402,
+					);
+					break;
+				}
+				if (message.rate_limit_info.status === "rejected") {
+					failed = true;
+					const kind = message.rate_limit_info.rateLimitType;
+					yield errorEvent(`Claude subscription rate limit rejected${kind ? ` (${kind})` : ""}.`, "rate_limit", 429);
+					break;
+				}
+			}
+
+			if (message.type === "result") {
+				warnOnContextMismatch(message, opts.model);
+				authoritativeUsage = mergeUsage(streamedUsage, message.usage);
+				stopReason = message.stop_reason;
+				const failure = resultError(message);
+				if (failure) {
+					failed = true;
+					yield failure;
+					break;
+				}
+				if (!sawText && message.subtype === "success" && message.result) {
+					sawText = true;
+					yield { type: "text", delta: message.result };
+				}
+			}
+		}
+
+		if (failed && activeQuery) {
+			try {
+				await activeQuery.interrupt();
+			} catch {
+				// Closing below is authoritative cleanup.
+			}
+		}
+
+		if (!aborted && !failed && !authenticated) {
+			failed = true;
+			yield errorEvent("Claude Agent SDK ended without OAuth authentication initialization.", "authentication_failed");
+		}
+	} catch (error) {
+		if (!aborted) {
+			failed = true;
+			const value = error as any;
+			yield errorEvent(
+				error instanceof Error ? error.message : String(error),
+				typeof value?.status === "string" ? value.status : undefined,
+				typeof value?.status === "number" ? value.status : value?.statusCode,
+			);
+		}
 	} finally {
 		if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
-		try {
-			if (child.exitCode === null) child.kill("SIGKILL");
-		} catch {
-			/* ignore */
+		if (activeQuery) {
+			try {
+				activeQuery.close();
+			} catch {
+				// Best-effort cleanup.
+			}
 		}
 		if (session) {
 			try {
 				deleteSession(session.sessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
 			} catch {
-				/* best-effort */
+				// Temporary replay cleanup is best effort.
 			}
 		}
 	}
 
-	if (!emittedError) {
-		yield { type: "usage", usage: finalUsage };
+	if (!aborted && !failed) {
+		yield { type: "usage", usage: authoritativeUsage ?? streamedUsage };
 		yield { type: "done", stopReason };
 	}
 }

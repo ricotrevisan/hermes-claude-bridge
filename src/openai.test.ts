@@ -21,7 +21,7 @@ test("mapStopReason: Anthropic stop reasons → OpenAI finish_reason", () => {
 	assert.equal(mapStopReason("end_turn"), "stop");
 	assert.equal(mapStopReason("stop_sequence"), "stop");
 	assert.equal(mapStopReason("max_tokens"), "length");
-	assert.equal(mapStopReason("tool_use"), "tool_calls");
+	assert.equal(mapStopReason("tool_use"), "stop");
 	assert.equal(mapStopReason(null), "stop");
 	assert.equal(mapStopReason(undefined), "stop");
 });

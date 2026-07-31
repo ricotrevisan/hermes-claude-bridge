@@ -12,7 +12,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { runClaude, forceSubscriptionAuth, describeError, type BridgeEvent } from "./bridge.js";
+import { runClaude, describeError, type BridgeEvent } from "./bridge.js";
 import {
 	completion,
 	contentChunk,
@@ -28,20 +28,9 @@ import {
 	type OpenAIFinishReason,
 } from "./openai.js";
 import type { OpenAIMessage } from "./convert.js";
+import { expectedContextWindow, MODEL_IDS, resolveModel, runtimeModelId } from "./models.js";
 
 const DEFAULT_PORT = 8787;
-const DEFAULT_MODEL = "claude-opus-4-8";
-const MODELS = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"];
-const MODEL_ALIASES: Record<string, string> = {
-	opus: "claude-opus-4-8",
-	sonnet: "claude-sonnet-4-6",
-	haiku: "claude-haiku-4-5",
-};
-
-function resolveModel(requested: string | undefined): string {
-	if (!requested) return DEFAULT_MODEL;
-	return MODEL_ALIASES[requested.toLowerCase()] ?? requested;
-}
 
 function newId(): string {
 	return "chatcmpl-" + randomBytes(12).toString("hex");
@@ -76,11 +65,37 @@ function modelsResponse(): unknown {
 	const created = nowSeconds();
 	return {
 		object: "list",
-		data: MODELS.map((id) => ({ id, object: "model", created, owned_by: "anthropic" })),
+		data: MODEL_IDS.map((id) => ({
+			id,
+			object: "model",
+			created,
+			owned_by: "anthropic",
+			context_window: expectedContextWindow(id),
+		})),
 	};
 }
 
-async function handleChatCompletion(req: IncomingMessage, res: ServerResponse): Promise<void> {
+export type BridgeRunner = typeof runClaude;
+
+function errorHttpStatus(event: Extract<BridgeEvent, { type: "error" }>): number {
+	if (event.status === "authentication_failed") return 401;
+	if (event.status === "overage") return 402;
+	if (event.status === "rate_limit" || event.httpStatus === 429) return 429;
+	if (event.httpStatus === 400) return 400;
+	return 502;
+}
+
+async function handleChatCompletion(req: IncomingMessage, res: ServerResponse, runner: BridgeRunner): Promise<void> {
+	if (req.headers.origin) {
+		sendError(res, 403, "browser-origin requests are not allowed", "forbidden");
+		return;
+	}
+	const contentType = req.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase();
+	if (contentType !== "application/json") {
+		sendError(res, 415, "Content-Type must be application/json", "invalid_request_error");
+		return;
+	}
+
 	let parsed: any;
 	try {
 		parsed = JSON.parse(await readBody(req));
@@ -95,6 +110,10 @@ async function handleChatCompletion(req: IncomingMessage, res: ServerResponse): 
 		return;
 	}
 
+	if (parsed?.model !== undefined && typeof parsed.model !== "string") {
+		sendError(res, 400, "`model` must be a string", "invalid_request_error");
+		return;
+	}
 	const model = resolveModel(parsed?.model);
 	const stream = parsed?.stream === true;
 	const reasoning = parsed?.reasoning_effort ?? parsed?.reasoning?.effort;
@@ -105,7 +124,7 @@ async function handleChatCompletion(req: IncomingMessage, res: ServerResponse): 
 		if (!res.writableEnded) ac.abort();
 	});
 
-	const events = runClaude(messages, { model, reasoning, signal: ac.signal });
+	const events = runner(messages, { model: runtimeModelId(model), reasoning, signal: ac.signal });
 	if (stream) {
 		await streamResponse(res, events, model);
 	} else {
@@ -164,7 +183,7 @@ async function streamResponse(
 				case "error": {
 					const msg = describeError(ev.message, ev.status);
 					if (!headersSent) {
-						sendError(res, 502, msg, "upstream_error");
+						sendError(res, errorHttpStatus(ev), msg, "upstream_error");
 						return;
 					}
 					// Mid-stream failure: surface the error as content, then finish
@@ -201,6 +220,7 @@ async function bufferResponse(
 	let usage: AnthropicUsage = {};
 	let stopReason: string | null = null;
 	let errorMessage: string | null = null;
+	let errorStatus = 502;
 
 	try {
 		for await (const ev of events) {
@@ -219,6 +239,7 @@ async function bufferResponse(
 					break;
 				case "error":
 					errorMessage = describeError(ev.message, ev.status);
+					errorStatus = errorHttpStatus(ev);
 					break;
 			}
 		}
@@ -226,8 +247,8 @@ async function bufferResponse(
 		errorMessage = describeError(err instanceof Error ? err.message : String(err));
 	}
 
-	if (errorMessage && !content) {
-		sendError(res, 502, errorMessage, "upstream_error");
+	if (errorMessage) {
+		sendError(res, errorStatus, errorMessage, "upstream_error");
 		return;
 	}
 
@@ -243,7 +264,7 @@ async function bufferResponse(
 	);
 }
 
-function handler(req: IncomingMessage, res: ServerResponse): void {
+function handler(req: IncomingMessage, res: ServerResponse, runner: BridgeRunner): void {
 	const url = (req.url ?? "").split("?")[0];
 	const method = req.method ?? "GET";
 
@@ -256,7 +277,7 @@ function handler(req: IncomingMessage, res: ServerResponse): void {
 		return;
 	}
 	if (method === "POST" && (url === "/v1/chat/completions" || url === "/chat/completions")) {
-		void handleChatCompletion(req, res).catch((err) => {
+		void handleChatCompletion(req, res, runner).catch((err) => {
 			const msg = err instanceof Error ? err.message : String(err);
 			if (!res.headersSent) sendError(res, 500, msg);
 			else if (!res.writableEnded) res.end();
@@ -267,9 +288,12 @@ function handler(req: IncomingMessage, res: ServerResponse): void {
 	sendError(res, 404, `no route for ${method} ${url}`, "not_found");
 }
 
+export function createBridgeServer(runner: BridgeRunner = runClaude): ReturnType<typeof createServer> {
+	return createServer((req, res) => handler(req, res, runner));
+}
+
 export function startServer(port = Number(process.env.CLAUDE_BRIDGE_PORT) || DEFAULT_PORT): ReturnType<typeof createServer> {
-	forceSubscriptionAuth();
-	const server = createServer(handler);
+	const server = createBridgeServer();
 	server.on("error", (err: NodeJS.ErrnoException) => {
 		if (err.code === "EADDRINUSE") {
 			console.error(`hermes-claude-bridge: port ${port} is already in use — another bridge instance may be running. Exiting; the service will retry.`);
@@ -280,7 +304,7 @@ export function startServer(port = Number(process.env.CLAUDE_BRIDGE_PORT) || DEF
 	});
 	server.listen(port, "127.0.0.1", () => {
 		// eslint-disable-next-line no-console
-		console.log(`hermes-claude-bridge listening on http://127.0.0.1:${port} (models: ${MODELS.join(", ")})`);
+		console.log(`hermes-claude-bridge listening on http://127.0.0.1:${port} (models: ${MODEL_IDS.join(", ")})`);
 	});
 	return server;
 }

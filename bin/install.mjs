@@ -1,7 +1,7 @@
 // Installer for hermes-claude-bridge.
 //
-// 1. Copy the bundled server to a STABLE app dir ($HERMES_HOME/claude-bridge/)
-//    so the long-lived service never points into an ephemeral npx cache.
+// 1. Copy the server to a STABLE app dir ($HERMES_HOME/claude-bridge/) and
+//    install the pinned Agent SDK runtime there, outside the ephemeral npx cache.
 // 2. Write the Hermes model-provider plugin to $HERMES_HOME/plugins/model-providers/claude-bridge/.
 // 3. Add a providers entry to config.yaml + a placeholder key to .env so the
 //    `hermes model` picker and runtime both recognize the provider.
@@ -30,9 +30,11 @@ const LABEL = "com.ricotrevisan.hermes-claude-bridge";
 const DEFAULT_PORT = "8787";
 const ENV_KEY = "CLAUDE_BRIDGE_API_KEY";
 const ENV_VALUE = "claude-code-subscription";
-const DEPRECATION_MESSAGE =
-	"hermes-claude-bridge is deprecated and install is disabled. " +
-	"Use Hermes' native Anthropic provider for API-key usage, or the Hermes claude-code skill for Claude Code delegation.";
+const PACKAGE_JSON = JSON.parse(readFileSync(join(PKG_ROOT, "package.json"), "utf8"));
+const AGENT_SDK_VERSION = PACKAGE_JSON.dependencies?.["@anthropic-ai/claude-agent-sdk"];
+if (!/^\d+\.\d+\.\d+$/.test(AGENT_SDK_VERSION ?? "")) {
+	throw new Error("package.json must pin @anthropic-ai/claude-agent-sdk to an exact version");
+}
 
 function parseArgs(argv) {
 	const args = { port: process.env.CLAUDE_BRIDGE_PORT || DEFAULT_PORT, link: false, service: true };
@@ -80,15 +82,36 @@ function ensureDist() {
 	return distServer;
 }
 
-// Copy the self-contained server into a stable location so the service survives
-// npx-cache eviction. Returns the stable server path.
+// Copy the server into a stable location so the service survives npx-cache
+// eviction, then install the Agent SDK beside it. The SDK is intentionally not
+// bundled: it discovers its platform-specific Claude Code executable relative
+// to its own package directory.
 function installRuntime(distServer) {
 	const dir = stableRuntimeDir();
 	mkdirSync(dir, { recursive: true });
 	const stableServer = join(dir, "server.js");
 	copyFileSync(distServer, stableServer);
-	// Mark as ESM so node doesn't warn/reparse, and pin a version stamp.
-	writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "hermes-claude-bridge-runtime", private: true, type: "module" }, null, 2) + "\n");
+	writeFileSync(
+		join(dir, "package.json"),
+		JSON.stringify({
+			name: "hermes-claude-bridge-runtime",
+			private: true,
+			type: "module",
+			dependencies: { "@anthropic-ai/claude-agent-sdk": AGENT_SDK_VERSION },
+		}, null, 2) + "\n",
+	);
+	console.log(`• Installing Claude Agent SDK ${AGENT_SDK_VERSION} runtime (includes a platform-specific Claude Code executable)…`);
+	try {
+		execFileSync("npm", ["install", "--omit=dev", "--no-audit", "--no-fund", "--save-exact"], {
+			cwd: dir,
+			stdio: "inherit",
+		});
+	} catch (error) {
+		throw new Error(
+			`could not install the Claude Agent SDK runtime in ${dir}; ensure npm can reach the registry and re-run install`,
+			{ cause: error },
+		);
+	}
 	return stableServer;
 }
 
@@ -273,7 +296,10 @@ async function installService(node, stableServer, port, logFile) {
 	console.log("• Tip: to start the bridge before you log in: loginctl enable-linger $USER");
 	try {
 		execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "inherit" });
-		execFileSync("systemctl", ["--user", "enable", "--now", "hermes-claude-bridge.service"], { stdio: "inherit" });
+		execFileSync("systemctl", ["--user", "enable", "hermes-claude-bridge.service"], { stdio: "inherit" });
+		// `enable --now` leaves an already-active process untouched, which means a
+		// reinstall can report healthy while still serving the previous bundle.
+		execFileSync("systemctl", ["--user", "restart", "hermes-claude-bridge.service"], { stdio: "inherit" });
 		return { svcFile: svc.file, activated: true };
 	} catch {
 		console.log(
@@ -302,10 +328,6 @@ async function healthCheck(port, attempts = 40) {
 }
 
 export async function install(argv) {
-	if (!argv.includes("--force-deprecated-install")) {
-		throw new Error(`${DEPRECATION_MESSAGE} Existing installs can be removed with: hermes-claude-bridge uninstall. To override, pass --force-deprecated-install.`);
-	}
-
 	if (platform() === "win32") {
 		throw new Error(
 			"Windows is not supported yet — use WSL. (You can still run the bridge manually with " +
@@ -318,12 +340,12 @@ export async function install(argv) {
 	const home = hermesHome();
 
 	// Transparency: state what will change before mutating anything.
-	console.log(`hermes-claude-bridge install — DEPRECATED OVERRIDE — this will:
+	console.log(`hermes-claude-bridge install — this will:
   • copy the bridge server to ${stableRuntimeDir()}
   • write a provider plugin to ${join(home, "plugins", "model-providers", "claude-bridge")}
   • add a placeholder ${ENV_KEY} to ${join(home, ".env")} (the bridge ignores its value)
   • add providers.claude-bridge to ${join(home, "config.yaml")}${service ? `\n  • register a background auto-start service (${platform() === "darwin" ? "launchd" : "systemd --user"})` : ""}
-  • the bridge unsets ANTHROPIC_* at runtime so turns use your Claude Code subscription
+  • install the Agent SDK runtime and force OAuth subscription auth for every turn
   (reverse all of this any time with: hermes-claude-bridge uninstall)
 `);
 
@@ -363,13 +385,14 @@ export async function install(argv) {
 
 Next steps:
   1. Make sure Claude Code is logged in:   claude login
-  2. Pick the provider AND a model:        hermes model  → 'claude-bridge' → e.g. claude-opus-4-8
-     (or in a running session:  /model claude-opus-4-8 --provider claude-bridge)
+  2. Pick the provider AND a model:        hermes model  → 'claude-bridge' → e.g. claude-opus-5
+     (or in a running session:  /model claude-opus-5 --provider claude-bridge)
      If a Hermes session is already open, restart it so it re-reads config.yaml.
-  3. Chat as usual — turns run on your Claude Code subscription (no API key).
+  3. Chat as usual — Agent SDK turns run on your Claude subscription (no API key).
 
 Notes:
   • The bridge listens on 127.0.0.1:${port} and is reachable only locally.
+  • The Agent SDK runtime includes a platform-specific Claude Code executable (~200 MB).
   • Re-run install after upgrading the package to refresh the stable runtime copy.
   • Uninstall with: hermes-claude-bridge uninstall`);
 }

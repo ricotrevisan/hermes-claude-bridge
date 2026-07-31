@@ -1,198 +1,145 @@
-# hermes-claude-bridge — DEPRECATED
+# hermes-claude-bridge
 
-> **Deprecated / not recommended.** This bridge is no longer maintained. In its
-> default mode it exposes Claude Code as a plain text model with no tools; if
-> tool use is enabled, it overlaps with Hermes' `claude-code` skill while hiding
-> agentic file/shell access behind a model-provider selection. Use Hermes' native
-> Anthropic provider for API-key usage, or Hermes' `claude-code` skill when you
-> intentionally want Claude Code delegation.
->
-> Existing local installs can be removed with `hermes-claude-bridge uninstall`.
+Use Claude as a model provider in [Hermes Agent](https://github.com/NousResearch/hermes-agent) through the Claude Agent SDK and your Claude subscription OAuth login. No `ANTHROPIC_API_KEY` is required or accepted by the bridge.
 
-Historically, this package used **Claude** — powered by your **Claude Code
-Pro/Max subscription** — as a model provider for the
-[Hermes agent](https://github.com/NousResearch/hermes-agent). **No
-`ANTHROPIC_API_KEY` required.** Ported/adapted from
-[`pi-claude-bridge`](https://github.com/elidickinson/pi-claude-bridge) (the same
-idea for the Pi agent).
+Adapted from [`pi-claude-bridge`](https://github.com/elidickinson/pi-claude-bridge).
 
-```
-Hermes ──HTTP (OpenAI chat/completions)──▶  local bridge server  ──▶  claude -p (stream-json)
-        base_url=http://127.0.0.1:8787/v1     (this package, Node)      (Claude Code subscription)
+```text
+Hermes ── OpenAI chat/completions ──▶ localhost bridge ──▶ Claude Agent SDK ──▶ Claude subscription
+       http://127.0.0.1:8787/v1        this package          OAuth from `claude login`
 ```
 
-The bridge is a tiny local HTTP server that speaks the **OpenAI Chat Completions**
-API. Each request is run through your installed Claude Code CLI in print mode
-(`claude -p --output-format stream-json`), and its streamed events are translated
-back into OpenAI SSE. A declarative Hermes **provider plugin** points Hermes at
-the bridge — Hermes reaches it over plain `chat_completions` HTTP and spawns
-nothing itself.
-
-> **Why `claude -p` and not the Claude Agent SDK?** The Agent SDK spawns its own
-> bundled CLI tagged `CLAUDE_CODE_ENTRYPOINT=sdk-ts`, which Anthropic meters as
-> SDK/API usage — it draws *extra usage* (overage), not your subscription
-> allowance. The standalone `claude -p` (and `acp`) is the entrypoint Anthropic
-> allows to run on the Pro/Max subscription. The bridge therefore shells out to
-> your installed `claude` binary.
-
----
+As observed by `pi-claude-bridge`, Anthropic restored Agent SDK use against Claude subscription quota in June 2026. This is an upstream entitlement and can change independently of this package. The bridge verifies that the SDK reports a first-party account with a subscription, rejects explicit API-key credential sources, and aborts if a rate-limit event says the turn selected Extra Usage.
 
 ## Prerequisites
 
-- **Claude Code installed and logged in** to a Pro/Max subscription: `claude login`.
-  The bridge runs `claude` from your `PATH` (override with `CLAUDE_BRIDGE_CLAUDE_BIN`).
-- **Hermes agent installed** (`hermes` on your `PATH`, `~/.hermes/` present).
-- **Node.js ≥ 20.**
-- **macOS or Linux.** (Windows: use WSL.)
-
----
+- Claude Code logged into a subscription account: `claude login`
+- Hermes Agent installed
+- Node.js 20 or newer
+- macOS or Linux (Windows users can use WSL)
 
 ## Install
 
-Installation is disabled by default because this package is deprecated.
-
 ```bash
 npx hermes-claude-bridge install
-# → fails with a deprecation message
 ```
 
-Historical installs can still be removed:
+The installer:
 
-### Uninstall
+1. Installs a stable runtime under `~/.hermes/claude-bridge/`.
+2. Installs the Claude Agent SDK and its platform-specific Claude Code executable there (about 200 MB).
+3. Installs the Hermes provider plugin.
+4. Adds the local provider to `~/.hermes/config.yaml`.
+5. Registers a launchd or systemd user service unless `--no-service` is passed.
+
+Then choose **Claude Bridge** with `hermes model`, or from a running session:
+
+```text
+/model claude-opus-5 --provider claude-bridge
+```
+
+Uninstall everything created by the installer with:
 
 ```bash
 npx hermes-claude-bridge uninstall
 ```
 
-Removes the service, the stable runtime copy, the plugin dir, the
-`providers.claude-bridge` config entry, and the placeholder key (a key you set
-yourself is left untouched). Your Claude Code login is unaffected.
+## Models
 
----
+The bridge advertises the current `pi-claude-bridge` Claude Code catalog:
 
-## What the installer changes
+- `claude-fable-5`
+- `claude-opus-5`
+- `claude-opus-4-8`
+- `claude-opus-4-7`
+- `claude-opus-4-6`
+- `claude-sonnet-5`
+- `claude-sonnet-4-6`
+- `claude-haiku-4-5`
 
-For transparency — installing mutates these, and `uninstall` reverses all of them:
+Aliases `fable`, `opus`, `sonnet`, and `haiku` resolve to the newest advertised model in each family. Explicit unknown model IDs pass through to Claude Code.
 
-| Path | Change |
-| --- | --- |
-| `~/.hermes/claude-bridge/` | Self-contained server copy (created). |
-| `~/.hermes/plugins/model-providers/claude-bridge/` | Provider plugin (`__init__.py` + `plugin.yaml`). |
-| `~/.hermes/.env` | One placeholder line `CLAUDE_BRIDGE_API_KEY=…` (the bridge ignores its value; Hermes just needs *a* key to route). |
-| `~/.hermes/config.yaml` | A `providers.claude-bridge` entry (comment-preserving; your other keys untouched). |
-| launchd plist / systemd unit | The auto-start service. |
+The bridge keeps these stable public IDs while using a measured runtime context policy:
 
-**Security/trust note:** the bridge binds to `127.0.0.1` only and is reachable
-only from your machine. It runs on *your* Claude Code subscription, can read your
-`~/.hermes` config, and (in full-agent mode) lets Claude run tools in a working
-directory. At startup it unsets `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` /
-`ANTHROPIC_BASE_URL` so turns can't silently fall through to a metered API key.
-The source is small — read `src/` before trusting it.
+| Public model | Claude Code runtime ID | Advertised context |
+| --- | --- | ---: |
+| `claude-fable-5` | `claude-fable-5[1m]` | 1M |
+| `claude-opus-5` | `claude-opus-5[1m]` | 1M |
+| `claude-opus-4-8` | `claude-opus-4-8[1m]` | 1M |
+| `claude-opus-4-7` | same (bare ID serves 1M) | 1M |
+| `claude-sonnet-5` | `claude-sonnet-5[1m]` | 1M |
+| `claude-opus-4-6` | same | 200K |
+| `claude-sonnet-4-6` | same | 200K |
+| `claude-haiku-4-5` | same | 200K |
 
----
+This table is hard-coded from measured Agent SDK subscription behavior; probing would spend quota and result metadata arrives too late for Hermes's current turn. The bridge checks the served `modelUsage.contextWindow` after each result and logs a warning if Anthropic's behavior drifts. It never enables a long-context form known to require Extra Usage.
 
 ## How it works
 
-- **Endpoints:** `POST /v1/chat/completions` (streaming + non-streaming),
-  `GET /v1/models`, `GET /healthz`. Bound to `127.0.0.1` only.
-- **Inbound:** OpenAI `messages[]` → Anthropic-shaped messages. The trailing user
-  turn becomes the live prompt; prior turns are replayed into a resumable
-  [`cc-session-io`](https://www.npmjs.com/package/cc-session-io) session and
-  continued via `claude --resume`, so multi-turn context is preserved.
-- **Outbound:** the CLI's `stream-json` events are translated to OpenAI SSE — text
-  deltas → `choices[0].delta.content`, thinking → `delta.reasoning_content`, then a
-  chunk carrying `finish_reason`, a final `choices: []` chunk with `usage`, and
-  `data: [DONE]` (the exact shape Hermes' streaming consumer requires).
+The local server implements:
 
-### Clean assistant (default) vs. full agent
+- `POST /v1/chat/completions` (streaming and buffered)
+- `GET /v1/models`
+- `GET /healthz`
 
-- **Clean assistant (default):** Claude answers as a plain conversational model —
-  no tools (`--tools ""`), no MCP (`--strict-mcp-config`), no hooks
-  (`--settings '{"disableAllHooks":true}'`), and a replaced system prompt (the
-  inbound Hermes system prompt, or a minimal default). This keeps your Claude Code
-  setup (skills, auto-memory, hooks) from leaking side-actions or tool narration
-  into chat answers.
-- **Full agent (`CLAUDE_BRIDGE_FULL_AGENT=1`):** Claude runs with your complete
-  Claude Code config and its **own** tools (Read/Write/Bash/… via
-  `bypassPermissions`), operating in `CLAUDE_BRIDGE_CWD` (default: your home dir).
-  More capable, but verbose and prone to agentic side-actions on simple turns.
-  Hermes' own tools are not used in either mode — the bridge streams text only.
+For each request it:
 
----
+1. Converts OpenAI history to a temporary Claude Code session.
+2. Sends the trailing user turn through Agent SDK `query()`.
+3. Streams text, reasoning, usage, stop reasons, and errors back as OpenAI-compatible output.
+4. Closes the SDK query and deletes the temporary session.
+
+The child environment removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_TOKEN`, and `ANTHROPIC_BASE_URL`. It also disables auto-loaded settings, skills, hooks, filesystem/cloud MCP servers, auto-memory, and auto-compaction in the default mode.
+
+The bridge uses the Agent SDK's official Claude Code system-prompt preset and does not forward Hermes's outer harness system prompt. This boundary is load-bearing for subscription routing: a raw custom system prompt, or appending the full Hermes harness prompt, was observed to route the request through Extra Usage instead. User conversation messages are still replayed normally.
+
+### Default and full-agent modes
+
+**Default:** Claude behaves as a clean conversational model. Claude Code tools are disabled. Hermes tool bridging is not implemented yet.
+
+**Full agent:** set `CLAUDE_BRIDGE_FULL_AGENT=1` before starting the bridge. Claude Code gets its own built-in tools with bypass permissions. This is powerful and can read, write, or execute commands in `CLAUDE_BRIDGE_CWD`; it still does not execute Hermes tools.
+
+### Roadmap
+
+Hermes tool passthrough is deliberately outside the `0.2.0` scope. The proposed stateful MCP adapter is specified in [GitHub issue #1](https://github.com/ricotrevisan/hermes-claude-bridge/issues/1). Until that work is implemented and hardened, default mode remains tool-free and full-agent mode uses only Claude Code's tools.
 
 ## Configuration
 
-| Env var | Default | Meaning |
+| Environment variable | Default | Meaning |
 | --- | --- | --- |
-| `CLAUDE_BRIDGE_PORT` | `8787` | Port the bridge binds (must match the plugin's `base_url`; the installer keeps them in sync). |
-| `CLAUDE_BRIDGE_CWD` | home dir | Working directory Claude operates in (full-agent file/bash tools). |
-| `CLAUDE_BRIDGE_CLAUDE_BIN` | `claude` | Path to the Claude Code CLI if it isn't on `PATH`. |
-| `CLAUDE_BRIDGE_FULL_AGENT` | unset | `1` → full-agent mode (see above). |
-| `CLAUDE_BRIDGE_DEBUG` | unset | `1` → log SDK message shapes + errors to stderr / the service log. |
-| `CLAUDE_CONFIG_DIR` | `~/.claude` | Honored for session files + credentials (standard Claude Code). |
-
-Advertised models: `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`
-(aliases `opus`, `sonnet`, `haiku` also resolve).
-
----
+| `CLAUDE_BRIDGE_PORT` | `8787` | Local HTTP port. |
+| `CLAUDE_BRIDGE_CWD` | process working directory (`$HOME` for the installed service) | Claude Code working directory. |
+| `CLAUDE_BRIDGE_CLAUDE_BIN` | SDK bundled executable | Override the Claude Code executable used by the SDK. |
+| `CLAUDE_BRIDGE_FULL_AGENT` | unset | Set to `1` for Claude Code's built-in agent tools. |
+| `CLAUDE_CONFIG_DIR` | Claude Code default | Alternate Claude Code credentials/session directory. |
 
 ## Development
 
 ```bash
 npm install
-npm test          # unit tests (message conversion + SSE framing)
-npm run build     # type-check (tsc --noEmit) + esbuild bundle → dist/server.js
-npm run dev       # run the bridge from source via tsx (no build step)
-```
-
-Historical symlink workflow (only if deliberately overriding deprecation):
-
-```bash
-npx hermes-claude-bridge install --force-deprecated-install --link --no-service
-export CLAUDE_BRIDGE_PORT=8787   # in the same shell as both the bridge and hermes
+npm test
+npm run build
 npm run dev
 ```
 
-Manual checks:
+Manual smoke test:
 
 ```bash
 curl localhost:8787/healthz
 curl localhost:8787/v1/models
-curl localhost:8787/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"say hi"}]}'
+curl localhost:8787/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"Reply with only: bridge-ok"}]}'
 ```
 
----
+The normal test suite uses an injected fake SDK query and consumes no Claude quota. A manual smoke test uses the real OAuth subscription.
 
-## Troubleshooting
+## Security
 
-- **`Claude Code is not authenticated`** — run `claude login` (Pro/Max) and
-  restart the bridge. The bridge has no API key of its own.
-- **`You're out of extra usage`** — your Claude subscription window is exhausted.
-  This comes from Claude, not the bridge. Verify with `claude -p "hi"` directly: if
-  that also fails, wait for your window to reset (the bridge uses the same path).
-- **`Could not run the Claude Code CLI`** — `claude` isn't on the service's `PATH`.
-  Existing installs can set `CLAUDE_BRIDGE_CLAUDE_BIN` to its absolute path. Fresh
-  installs are deprecated and disabled unless deliberately overridden.
-- **`Unknown provider 'claude-bridge'`** in the picker — the provider was removed
-  or never installed. Prefer another Hermes provider or the `claude-code` skill;
-  do not reinstall this bridge unless deliberately overriding deprecation.
-- **Port already in use** — stop the other listener. Historical installs can use
-  `--force-deprecated-install --port N` if deliberately overriding deprecation.
-- **Check the bridge** — `curl localhost:8787/healthz`, then read
-  `~/.hermes/logs/claude-bridge.log`. `CLAUDE_BRIDGE_DEBUG=1` adds verbose tracing.
-- **Service stopped after upgrading the npm package** — prefer uninstalling this
-  deprecated bridge. Historical installs can be refreshed only by deliberately
-  overriding deprecation with `npx hermes-claude-bridge install --force-deprecated-install`.
+The server binds only to `127.0.0.1` and does not authenticate local requests. It rejects browser `Origin` requests and requires `application/json` to prevent cross-site simple POSTs, but any local process can still consume subscription quota through it. See [`SECURITY.md`](./SECURITY.md), especially before enabling full-agent mode.
 
----
+## Attribution and license
 
-## Acknowledgments
+The SDK transport, session ideas, and conversion logic are adapted from `pi-claude-bridge` by Eli Dickinson under the MIT License. See [`NOTICE`](./NOTICE).
 
-The Claude driver and message-conversion logic were ported/adapted from
-[pi-claude-bridge](https://github.com/elidickinson/pi-claude-bridge) by Eli
-Dickinson (MIT). See [`NOTICE`](./NOTICE).
-
-## License
-
-MIT © Rico Trevisan. See [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE).
+MIT © Rico Trevisan.

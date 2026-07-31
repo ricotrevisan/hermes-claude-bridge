@@ -2,8 +2,8 @@
 
 Declarative ProviderProfile only — it points Hermes at the local bridge server
 (an OpenAI-compatible endpoint backed by the Claude Agent SDK on your Claude
-Code subscription). Hermes reaches it over plain chat_completions HTTP; nothing
-is spawned by Hermes.
+subscription). Hermes reaches it over plain chat_completions HTTP; the bridge
+owns the SDK subprocess lifecycle.
 
 The bridge ignores authentication: requests to a localhost base_url with no key
 get a "no-key-required" placeholder from Hermes, exactly like a local Ollama /
@@ -19,13 +19,39 @@ bridge and `hermes`.
 
 import os
 
+from typing import Any
+
 from providers import register_provider
 from providers.base import ProviderProfile
 
 _PORT = os.environ.get("CLAUDE_BRIDGE_PORT", "8787")
 
+
+class ClaudeBridgeProfile(ProviderProfile):
+    """Forward Hermes reasoning effort using the bridge's OpenAI-compatible field."""
+
+    def build_api_kwargs_extras(
+        self,
+        *,
+        reasoning_config: dict | None = None,
+        **context: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not reasoning_config or reasoning_config.get("enabled") is False:
+            return {}, {}
+        effort = str(reasoning_config.get("effort", "medium")).lower()
+        effort = {
+            "none": None,
+            "off": None,
+            "minimal": "low",
+            "ultra": "max",
+        }.get(effort, effort)
+        if effort not in {"low", "medium", "high", "xhigh", "max"}:
+            return {}, {}
+        return {}, {"reasoning_effort": effort}
+
+
 register_provider(
-    ProviderProfile(
+    ClaudeBridgeProfile(
         name="claude-bridge",
         aliases=("claude-code", "cc-bridge"),
         display_name="Claude Bridge (Claude Code subscription)",
@@ -37,7 +63,12 @@ register_provider(
         supports_health_check=True,  # bridge implements GET /v1/models
         supports_vision=True,  # Claude is multimodal; the bridge passes images through
         fallback_models=(
+            "claude-fable-5",
+            "claude-opus-5",
             "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-5",
             "claude-sonnet-4-6",
             "claude-haiku-4-5",
         ),
