@@ -29,9 +29,10 @@ test("family aliases select the newest advertised model", () => {
 	assert.equal(resolveModel("haiku"), "claude-haiku-4-5");
 });
 
-test("explicit and unknown public model IDs pass through unchanged", () => {
+test("only explicit catalog IDs and aliases resolve", () => {
 	assert.equal(resolveModel("claude-opus-4-8"), "claude-opus-4-8");
-	assert.equal(resolveModel("future-model"), "future-model");
+	assert.equal(resolveModel("future-model"), undefined);
+	assert.equal(resolveModel("claude-sonnet-4-6[1m]"), undefined);
 	assert.equal(resolveModel(undefined), DEFAULT_MODEL);
 });
 
@@ -44,7 +45,7 @@ test("runtime IDs request only measured subscription-compatible context windows"
 	assert.equal(runtimeModelId("claude-sonnet-5"), "claude-sonnet-5[1m]");
 	assert.equal(runtimeModelId("claude-sonnet-4-6"), "claude-sonnet-4-6");
 	assert.equal(runtimeModelId("claude-haiku-4-5"), "claude-haiku-4-5");
-	assert.equal(runtimeModelId("future-model"), "future-model");
+	assert.throws(() => runtimeModelId("future-model"), /unsupported public model ID/);
 });
 
 test("advertised context matches the exact runtime form", () => {

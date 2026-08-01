@@ -29,20 +29,24 @@ export const MODEL_CATALOG: readonly ModelEntry[] = [
 export const MODEL_IDS = MODEL_CATALOG.map((model) => model.id);
 export const DEFAULT_MODEL = "claude-opus-5";
 
-const MODEL_ALIASES: Record<string, string> = {
-	fable: "claude-fable-5",
-	opus: "claude-opus-5",
-	sonnet: "claude-sonnet-5",
-	haiku: "claude-haiku-4-5",
-};
+const MODEL_ALIASES = new Map<string, string>([
+	["fable", "claude-fable-5"],
+	["opus", "claude-opus-5"],
+	["sonnet", "claude-sonnet-5"],
+	["haiku", "claude-haiku-4-5"],
+]);
 
-export function resolveModel(requested: string | undefined): string {
-	if (!requested) return DEFAULT_MODEL;
-	return MODEL_ALIASES[requested.toLowerCase()] ?? requested;
+export function resolveModel(requested: string | undefined): string | undefined {
+	if (requested === undefined) return DEFAULT_MODEL;
+	const alias = MODEL_ALIASES.get(requested.toLowerCase());
+	if (alias) return alias;
+	return MODEL_IDS.includes(requested) ? requested : undefined;
 }
 
 export function runtimeModelId(publicModelId: string): string {
-	return MODEL_CATALOG.find((model) => model.id === publicModelId)?.runtimeId ?? publicModelId;
+	const model = MODEL_CATALOG.find((entry) => entry.id === publicModelId);
+	if (!model) throw new Error(`unsupported public model ID: ${publicModelId}`);
+	return model.runtimeId;
 }
 
 export function expectedContextWindow(publicOrRuntimeModelId: string): number {

@@ -115,6 +115,15 @@ async function handleChatCompletion(req: IncomingMessage, res: ServerResponse, r
 		return;
 	}
 	const model = resolveModel(parsed?.model);
+	if (!model) {
+		sendError(
+			res,
+			400,
+			`unsupported model ${JSON.stringify(parsed.model)}; allowed model IDs: ${MODEL_IDS.join(", ")}`,
+			"invalid_request_error",
+		);
+		return;
+	}
 	const stream = parsed?.stream === true;
 	const reasoning = parsed?.reasoning_effort ?? parsed?.reasoning?.effort;
 

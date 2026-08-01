@@ -57,7 +57,7 @@ The bridge advertises the current `pi-claude-bridge` Claude Code catalog:
 - `claude-sonnet-4-6`
 - `claude-haiku-4-5`
 
-Aliases `fable`, `opus`, `sonnet`, and `haiku` resolve to the newest advertised model in each family. Explicit unknown model IDs pass through to Claude Code.
+Aliases `fable`, `opus`, `sonnet`, and `haiku` resolve to the newest advertised model in each family. Requests using any other model ID are rejected with HTTP 400 before Claude Code starts; runtime-only forms such as `claude-sonnet-4-6[1m]` cannot bypass the measured catalog.
 
 The bridge keeps these stable public IDs while using a measured runtime context policy:
 

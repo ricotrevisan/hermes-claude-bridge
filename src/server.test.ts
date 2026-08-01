@@ -88,6 +88,31 @@ test("streaming response preserves Hermes' required SSE frame order", async () =
 	});
 });
 
+test("HTTP edge rejects models outside the measured catalog before starting Claude", async () => {
+	let runnerStarted = false;
+	await withServer([], async (baseUrl) => {
+		for (const model of ["claude-sonnet-4-6[1m]", "future-model", "__proto__", "constructor"]) {
+			const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
+			});
+
+			assert.equal(response.status, 400, model);
+			const body: any = await response.json();
+			assert.equal(
+				body.error.message,
+				`unsupported model ${JSON.stringify(model)}; allowed model IDs: ` +
+					"claude-fable-5, claude-opus-5, claude-opus-4-8, claude-opus-4-7, " +
+					"claude-opus-4-6, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5",
+			);
+		}
+		assert.equal(runnerStarted, false);
+	}, () => {
+		runnerStarted = true;
+	});
+});
+
 test("HTTP edge rejects browser-origin, non-JSON, and malformed model requests", async () => {
 	await withServer([], async (baseUrl) => {
 		const browser = await fetch(`${baseUrl}/v1/chat/completions`, {
