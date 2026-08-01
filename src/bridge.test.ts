@@ -333,6 +333,13 @@ test("normalizes result, assistant, and rejected rate-limit failures", async (t)
 			httpStatus: 429,
 		},
 		{
+			name: "typed overage rejection without isUsingOverage",
+			messages: [init(), { type: "rate_limit_event", rate_limit_info: { status: "rejected", rateLimitType: "overage" } }],
+			status: "overage",
+			message: /Extra Usage/,
+			httpStatus: 402,
+		},
+		{
 			name: "Extra Usage selected",
 			messages: [init(), { type: "rate_limit_event", rate_limit_info: { status: "allowed", isUsingOverage: true } }],
 			status: "overage",
@@ -361,6 +368,46 @@ test("normalizes result, assistant, and rejected rate-limit failures", async (t)
 			if (item.httpStatus) assert.equal((events[0] as any).httpStatus, item.httpStatus);
 		});
 	}
+});
+
+test("a successful turn without rate-limit metadata warns that overage state is unverified", async (t) => {
+	const warn = t.mock.method(console, "warn", () => {});
+	const events = await collect([{ role: "user", content: "hi" }], {
+		model: "test",
+		queryFn: (() => fakeQuery([init(), result()])) as any,
+	});
+	assert.equal(events.at(-1)?.type, "done");
+	const warnings = warn.mock.calls.map((call) => String(call.arguments[0]));
+	assert.ok(warnings.some((line) => /overage state .*unverified/i.test(line)), `warnings: ${warnings.join(" | ")}`);
+});
+
+test("a turn with observed rate-limit metadata does not warn about unverified overage", async (t) => {
+	const warn = t.mock.method(console, "warn", () => {});
+	await collect([{ role: "user", content: "hi" }], {
+		model: "test",
+		queryFn: (() => fakeQuery([
+			init(),
+			{ type: "rate_limit_event", rate_limit_info: { status: "allowed", isUsingOverage: false } },
+			result(),
+		])) as any,
+	});
+	assert.equal(warn.mock.calls.length, 0);
+});
+
+test("overage detected after text has streamed still fails the turn without usage or done", async () => {
+	const events = await collect([{ role: "user", content: "hi" }], {
+		model: "test",
+		queryFn: (() => fakeQuery([
+			init(),
+			{ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "partial" } } },
+			{ type: "rate_limit_event", rate_limit_info: { status: "allowed", isUsingOverage: true } },
+			result(),
+		])) as any,
+	});
+	assert.deepEqual(events, [
+		{ type: "text", delta: "partial" },
+		{ type: "error", status: "overage", httpStatus: 402, message: "Claude Agent SDK selected Extra Usage instead of subscription quota; refusing the turn." },
+	]);
 });
 
 test("an unavailable overage lane does not reject an allowed subscription turn", async () => {

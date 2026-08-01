@@ -242,6 +242,7 @@ export async function* runClaude(
 	let subscriptionAccount = false;
 	let authenticated = false;
 	let sawText = false;
+	let sawRateLimitInfo = false;
 	let stopReason: string | null = null;
 	let streamedUsage: AnthropicUsage = {};
 	let authoritativeUsage: AnthropicUsage | null = null;
@@ -361,7 +362,9 @@ export async function* runClaude(
 			}
 
 			if (message.type === "rate_limit_event") {
-				if (message.rate_limit_info.isUsingOverage === true) {
+				sawRateLimitInfo = true;
+				const info = message.rate_limit_info;
+				if (info.isUsingOverage === true || (info.status === "rejected" && info.rateLimitType === "overage")) {
 					failed = true;
 					yield errorEvent(
 						"Claude Agent SDK selected Extra Usage instead of subscription quota; refusing the turn.",
@@ -437,6 +440,13 @@ export async function* runClaude(
 	}
 
 	if (!aborted && !failed) {
+		// The SDK's rate_limit_event cadence is not contractual; without it the
+		// bridge cannot prove the turn ran on subscription quota.
+		if (!sawRateLimitInfo) {
+			console.warn(
+				"hermes-claude-bridge: the SDK emitted no rate-limit metadata for this turn; overage state is unverified.",
+			);
+		}
 		yield { type: "usage", usage: authoritativeUsage ?? streamedUsage };
 		yield { type: "done", stopReason };
 	}
