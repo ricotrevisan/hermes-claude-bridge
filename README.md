@@ -94,7 +94,7 @@ Replayed history never enters your real `~/.claude/projects/`. The SDK materiali
 
 The child environment removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_TOKEN`, `ANTHROPIC_BASE_URL`, and every `CLAUDE_BRIDGE_*` variable (including the bridge's own token). It also disables auto-loaded settings, skills, hooks, filesystem/cloud MCP servers, auto-memory, and auto-compaction in the default mode.
 
-The bridge uses the Agent SDK's official Claude Code system-prompt preset and does not forward Hermes's outer harness system prompt. This boundary is load-bearing for subscription routing: a raw custom system prompt, or appending the full Hermes harness prompt, was observed to route the request through Extra Usage instead. User conversation messages are still replayed normally.
+The bridge uses the Agent SDK's official Claude Code system-prompt preset and never forwards inbound system content as the SDK's system prompt. This boundary is load-bearing for subscription routing: a raw custom system prompt, or appending the full Hermes harness prompt, was observed to route the request through Extra Usage instead. `system` and `developer` messages are instead delivered inside the live user turn, wrapped in a `<system-instructions>` block, so instructions like "always answer in French" still take effect.
 
 ### Default and full-agent modes
 

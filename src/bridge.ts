@@ -311,7 +311,7 @@ export async function* runClaude(
 
 		if (aborted) return;
 
-		const content = promptBlocks ?? (promptText || "[continue]");
+		const content = promptBlocks ?? promptText;
 		activeQuery = (opts.queryFn ?? sdkQuery)({
 			prompt: gatedPrompt(content, promptGate),
 			options: queryOptions(cwd, replay, opts),

@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## Unreleased
 
+- Fixed system content being silently dropped
+  ([#5](https://github.com/ricotrevisan/hermes-claude-bridge/issues/5)): `system` and
+  `developer` messages were extracted and then discarded, so "always answer in French" had
+  no effect. They are now delivered as a `<system-instructions>` preamble on the live user
+  turn. The SDK's `systemPrompt` remains locked to the official `claude_code` preset.
+
 - Fixed truncated SDK streams reporting success
   ([#8](https://github.com/ricotrevisan/hermes-claude-bridge/issues/8)): a stream that ends
   without a terminal result now fails the turn instead of finishing cleanly — 502 before

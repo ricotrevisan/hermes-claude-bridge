@@ -99,7 +99,10 @@ test("clean mode calls query with an isolated one-turn OAuth subscription config
 		assert.equal(closes, 1);
 		assert.deepEqual(await firstPrompt(params.prompt), {
 			type: "user",
-			message: { role: "user", content: "hello" },
+			message: {
+				role: "user",
+				content: "<system-instructions>\nUse this exact system prompt.\n</system-instructions>\n\nhello",
+			},
 			parent_tool_use_id: null,
 		});
 		assert.equal(params.options.model, "claude-test");
@@ -168,11 +171,11 @@ test("unknown-model errors are not misreported as a missing executable", () => {
 	assert.match(describeError("spawn claude ENOENT"), /Could not run Claude Code/);
 });
 
-test("clean mode keeps the Claude Code preset without forwarding the Hermes system prompt", async () => {
+test("clean mode keeps the Claude Code preset but still delivers system instructions", async () => {
 	let params: any;
 	await collect(
 		[
-			{ role: "system", content: "ignored" },
+			{ role: "system", content: "always answer in French" },
 			{ role: "user", content: "hi" },
 		],
 		{
@@ -184,6 +187,8 @@ test("clean mode keeps the Claude Code preset without forwarding the Hermes syst
 		},
 	);
 	assert.deepEqual(params.options.systemPrompt, { type: "preset", preset: "claude_code" });
+	const prompt = await firstPrompt(params.prompt);
+	assert.match(prompt.message.content, /always answer in French/);
 });
 
 test("full-agent mode uses Claude Code tools but still suppresses settings and MCP", async () => {

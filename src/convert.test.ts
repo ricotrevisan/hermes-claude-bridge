@@ -138,15 +138,14 @@ test("openaiMessagesToAnthropic: empty assistant turn (no text, no tool_calls) i
 	assert.deepEqual(out, [{ role: "user", content: "hi" }]);
 });
 
-test("splitConversation: trailing user message is the prompt; history excludes it; system extracted", () => {
+test("splitConversation: trailing user message is the prompt; history excludes it; system rides along", () => {
 	const r = splitConversation([
 		{ role: "system", content: "sys" },
 		{ role: "user", content: "first" },
 		{ role: "assistant", content: "reply" },
 		{ role: "user", content: "second" },
 	]);
-	assert.equal(r.system, "sys");
-	assert.equal(r.promptText, "second");
+	assert.equal(r.promptText, "<system-instructions>\nsys\n</system-instructions>\n\nsecond");
 	assert.equal(r.promptBlocks, undefined);
 	assert.deepEqual(r.history, [
 		{ role: "user", content: "first" },
@@ -220,4 +219,43 @@ test("splitConversation: trailing non-user message falls back to a continue prom
 		{ role: "user", content: "q" },
 		{ role: "assistant", content: [{ type: "text", text: "a" }] },
 	]);
+});
+
+test("splitConversation: developer messages also survive as a preamble", () => {
+	const r = splitConversation([
+		{ role: "developer", content: "always answer in French" },
+		{ role: "user", content: "hi" },
+	]);
+	assert.equal(r.promptText, "<system-instructions>\nalways answer in French\n</system-instructions>\n\nhi");
+});
+
+test("splitConversation: a system preamble does not swallow the empty-prompt continue fallback", () => {
+	const r = splitConversation([
+		{ role: "system", content: "sys" },
+		{ role: "user", content: "" },
+	]);
+	assert.equal(r.promptText, "<system-instructions>\nsys\n</system-instructions>\n\n[continue]");
+});
+
+test("splitConversation: system preamble leads the multimodal prompt blocks", () => {
+	const r = splitConversation([
+		{ role: "system", content: "sys" },
+		{
+			role: "user",
+			content: [
+				{ type: "text", text: "describe" },
+				{ type: "image_url", image_url: { url: "data:image/png;base64,WXYZ" } },
+			],
+		},
+	]);
+	assert.deepEqual(r.promptBlocks, [
+		{ type: "text", text: "<system-instructions>\nsys\n</system-instructions>" },
+		{ type: "text", text: "describe" },
+		{ type: "image", source: { type: "base64", media_type: "image/png", data: "WXYZ" } },
+	]);
+});
+
+test("splitConversation: no system messages leaves the prompt untouched", () => {
+	const r = splitConversation([{ role: "user", content: "plain" }]);
+	assert.equal(r.promptText, "plain");
 });

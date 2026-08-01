@@ -179,35 +179,48 @@ export function openaiMessagesToAnthropic(messages: OpenAIMessage[]): Message[] 
 }
 
 export type Conversation = {
-	system?: string;
 	history: Message[];
 	promptText: string;
 	promptBlocks?: ContentBlock[];
 };
 
+// The SDK's systemPrompt stays locked to the official claude_code preset: a
+// custom system prompt was observed to route the turn through Extra Usage
+// (SECURITY.md). System/developer messages therefore ride along as a preamble on
+// the live user turn rather than being dropped.
+function withSystemPreamble(conversation: Conversation, system: string | undefined): Conversation {
+	if (!system) return conversation;
+	const preamble = `<system-instructions>\n${system}\n</system-instructions>`;
+	return {
+		history: conversation.history,
+		promptText: conversation.promptText ? `${preamble}\n\n${conversation.promptText}` : preamble,
+		promptBlocks: conversation.promptBlocks && [{ type: "text", text: preamble }, ...conversation.promptBlocks],
+	};
+}
+
+function splitTurns(messages: OpenAIMessage[]): Conversation {
+	const last = messages[messages.length - 1];
+	if (!last || last.role !== "user") {
+		return { history: openaiMessagesToAnthropic(messages), promptText: "[continue]" };
+	}
+
+	const history = openaiMessagesToAnthropic(messages.slice(0, -1));
+	if (Array.isArray(last.content)) {
+		const blocks = userContentToBlocks(last.content);
+		const hasImage = blocks.some((b) => b.type === "image");
+		return { history, promptText: contentToText(last.content), promptBlocks: hasImage ? blocks : undefined };
+	}
+	return { history, promptText: typeof last.content === "string" ? last.content : "" };
+}
+
 /**
- * Split an OpenAI request into (system, resumable history, live prompt).
+ * Split an OpenAI request into (resumable history, live prompt).
  * The trailing user message becomes the prompt for query(); everything before
  * it is the session history to resume from. If the last message is not a user
  * message, fall back to a "[continue]" prompt with the full history.
  */
 export function splitConversation(messages: OpenAIMessage[]): Conversation {
-	const system = extractSystem(messages);
-	const last = messages[messages.length - 1];
-
-	if (last && last.role === "user") {
-		const history = openaiMessagesToAnthropic(messages.slice(0, -1));
-		if (typeof last.content === "string") {
-			return { system, history, promptText: last.content };
-		}
-		if (Array.isArray(last.content)) {
-			const blocks = userContentToBlocks(last.content);
-			const text = contentToText(last.content);
-			const hasImage = blocks.some((b) => b.type === "image");
-			return { system, history, promptText: text, promptBlocks: hasImage ? blocks : undefined };
-		}
-		return { system, history, promptText: "" };
-	}
-
-	return { system, history: openaiMessagesToAnthropic(messages), promptText: "[continue]" };
+	const turns = splitTurns(messages);
+	if (!turns.promptBlocks && !turns.promptText) turns.promptText = "[continue]";
+	return withSystemPreamble(turns, extractSystem(messages));
 }
