@@ -30,7 +30,8 @@ The installer:
 2. Installs the Claude Agent SDK and its platform-specific Claude Code executable there (about 200 MB).
 3. Installs the Hermes provider plugin.
 4. Adds the local provider to `~/.hermes/config.yaml`.
-5. Registers a launchd or systemd user service unless `--no-service` is passed.
+5. Generates a random `CLAUDE_BRIDGE_API_KEY` in `~/.hermes/.env` and gives the same token to the service.
+6. Registers a launchd or systemd user service unless `--no-service` is passed.
 
 Then choose **Claude Bridge** with `hermes model`, or from a running session:
 
@@ -89,7 +90,7 @@ For each request it:
 3. Streams text, reasoning, usage, stop reasons, and errors back as OpenAI-compatible output.
 4. Closes the SDK query and deletes the temporary session.
 
-The child environment removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_TOKEN`, and `ANTHROPIC_BASE_URL`. It also disables auto-loaded settings, skills, hooks, filesystem/cloud MCP servers, auto-memory, and auto-compaction in the default mode.
+The child environment removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_TOKEN`, `ANTHROPIC_BASE_URL`, and every `CLAUDE_BRIDGE_*` variable (including the bridge's own token). It also disables auto-loaded settings, skills, hooks, filesystem/cloud MCP servers, auto-memory, and auto-compaction in the default mode.
 
 The bridge uses the Agent SDK's official Claude Code system-prompt preset and does not forward Hermes's outer harness system prompt. This boundary is load-bearing for subscription routing: a raw custom system prompt, or appending the full Hermes harness prompt, was observed to route the request through Extra Usage instead. User conversation messages are still replayed normally.
 
@@ -97,7 +98,7 @@ The bridge uses the Agent SDK's official Claude Code system-prompt preset and do
 
 **Default:** Claude behaves as a clean conversational model. Claude Code tools are disabled. Hermes tool bridging is not implemented yet.
 
-**Full agent:** set `CLAUDE_BRIDGE_FULL_AGENT=1` before starting the bridge. Claude Code gets its own built-in tools with bypass permissions. This is powerful and can read, write, or execute commands in `CLAUDE_BRIDGE_CWD`; it still does not execute Hermes tools.
+**Full agent:** set `CLAUDE_BRIDGE_FULL_AGENT=1` before starting the bridge. Claude Code gets its own built-in tools with bypass permissions. This is powerful and can read, write, or execute commands starting from `CLAUDE_BRIDGE_CWD` (default `~/.hermes/claude-bridge-workspace`); it still does not execute Hermes tools.
 
 ### Roadmap
 
@@ -108,7 +109,8 @@ Hermes tool passthrough is deliberately outside the `0.2.0` scope. The proposed 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
 | `CLAUDE_BRIDGE_PORT` | `8787` | Local HTTP port. |
-| `CLAUDE_BRIDGE_CWD` | process working directory (`$HOME` for the installed service) | Claude Code working directory. |
+| `CLAUDE_BRIDGE_API_KEY` | none (required) | Bearer token every request except `/healthz` must present. The installer generates it. |
+| `CLAUDE_BRIDGE_CWD` | process working directory, or `~/.hermes/claude-bridge-workspace` in full-agent mode | Claude Code working directory. |
 | `CLAUDE_BRIDGE_CLAUDE_BIN` | SDK bundled executable | Override the Claude Code executable used by the SDK. |
 | `CLAUDE_BRIDGE_FULL_AGENT` | unset | Set to `1` for Claude Code's built-in agent tools. |
 | `CLAUDE_CONFIG_DIR` | Claude Code default | Alternate Claude Code credentials/session directory. |
@@ -119,15 +121,16 @@ Hermes tool passthrough is deliberately outside the `0.2.0` scope. The proposed 
 npm install
 npm test
 npm run build
-npm run dev
+CLAUDE_BRIDGE_API_KEY=dev-token npm run dev
 ```
 
 Manual smoke test:
 
 ```bash
 curl localhost:8787/healthz
-curl localhost:8787/v1/models
+curl localhost:8787/v1/models -H "Authorization: Bearer $CLAUDE_BRIDGE_API_KEY"
 curl localhost:8787/v1/chat/completions \
+  -H "Authorization: Bearer $CLAUDE_BRIDGE_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"Reply with only: bridge-ok"}]}'
 ```
@@ -136,7 +139,7 @@ The normal test suite uses an injected fake SDK query and consumes no Claude quo
 
 ## Security
 
-The server binds only to `127.0.0.1` and does not authenticate local requests. It rejects browser `Origin` requests and requires `application/json` to prevent cross-site simple POSTs, but any local process can still consume subscription quota through it. See [`SECURITY.md`](./SECURITY.md), especially before enabling full-agent mode.
+The server binds only to `127.0.0.1`, requires the per-install `CLAUDE_BRIDGE_API_KEY` bearer token on every route except `/healthz`, rejects browser `Origin` requests, and requires `application/json`. It refuses to start without a token. Any process that can read `~/.hermes/.env` can still spend subscription quota through it. See [`SECURITY.md`](./SECURITY.md), especially before enabling full-agent mode.
 
 ## Attribution and license
 

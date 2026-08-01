@@ -13,6 +13,9 @@ import {
 	type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
+import { mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { splitConversation, type OpenAIMessage } from "./convert.js";
 import { expectedContextWindow } from "./models.js";
 import type { AnthropicUsage } from "./openai.js";
@@ -78,7 +81,9 @@ function childEnvironment(): NodeJS.ProcessEnv {
 	delete env.CLAUDE_CODE_USE_BEDROCK;
 	delete env.CLAUDE_CODE_USE_VERTEX;
 	for (const key of Object.keys(env)) {
-		if (key.startsWith("ANTHROPIC_VERTEX_")) delete env[key];
+		// CLAUDE_BRIDGE_* holds the bridge's own token and mode switches; a
+		// prompt-injected full-agent turn must not be able to read them.
+		if (key.startsWith("ANTHROPIC_VERTEX_") || key.startsWith("CLAUDE_BRIDGE_")) delete env[key];
 	}
 	env.ENABLE_CLAUDEAI_MCP_SERVERS = "0";
 	env.DISABLE_AUTO_COMPACT = "1";
@@ -161,12 +166,25 @@ function resultError(message: any): BridgeEvent | null {
 	return errorEvent(text, status, message.api_error_status);
 }
 
+function fullAgentMode(): boolean {
+	return process.env.CLAUDE_BRIDGE_FULL_AGENT === "1";
+}
+
+// Full-agent turns run tools under bypassPermissions, so they get a dedicated
+// directory instead of inheriting $HOME from the installed service. It sits
+// beside the runtime dir, not inside it, so uninstall cannot delete its files.
+function ensureFullAgentWorkspace(): string {
+	const dir = join(process.env.HERMES_HOME || join(homedir(), ".hermes"), "claude-bridge-workspace");
+	mkdirSync(dir, { recursive: true });
+	return dir;
+}
+
 function queryOptions(
 	cwd: string,
 	resume: string | undefined,
 	opts: RunOptions,
 ): ClaudeQueryOptions {
-	const fullAgent = process.env.CLAUDE_BRIDGE_FULL_AGENT === "1";
+	const fullAgent = fullAgentMode();
 	const effort = opts.reasoning ? REASONING_TO_EFFORT[opts.reasoning.toLowerCase()] : undefined;
 	const executable = process.env.CLAUDE_BRIDGE_CLAUDE_BIN;
 
@@ -229,7 +247,7 @@ export async function* runClaude(
 	messages: OpenAIMessage[],
 	opts: RunOptions,
 ): AsyncGenerator<BridgeEvent> {
-	const cwd = opts.cwd || process.env.CLAUDE_BRIDGE_CWD || process.cwd();
+	const cwd = opts.cwd || process.env.CLAUDE_BRIDGE_CWD || (fullAgentMode() ? ensureFullAgentWorkspace() : process.cwd());
 	const { history, promptText, promptBlocks } = splitConversation(messages);
 	let session: ReturnType<typeof createSession> | null = null;
 	let activeQuery: Query | null = null;

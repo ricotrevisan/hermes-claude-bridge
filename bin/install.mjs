@@ -3,14 +3,17 @@
 // 1. Copy the server to a STABLE app dir ($HERMES_HOME/claude-bridge/) and
 //    install the pinned Agent SDK runtime there, outside the ephemeral npx cache.
 // 2. Write the Hermes model-provider plugin to $HERMES_HOME/plugins/model-providers/claude-bridge/.
-// 3. Add a providers entry to config.yaml + a placeholder key to .env so the
-//    `hermes model` picker and runtime both recognize the provider.
+// 3. Add a providers entry to config.yaml + a per-install bearer token to .env
+//    so the `hermes model` picker and runtime both recognize the provider and
+//    can authenticate to the bridge.
 // 4. Register a background auto-start service (launchd on macOS, systemd --user
 //    on Linux) running the stable server copy. Health-check, print next steps.
 
 import { execFileSync, execSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { createConnection } from "node:net";
 import {
+	chmodSync,
 	copyFileSync,
 	existsSync,
 	mkdirSync,
@@ -29,7 +32,8 @@ const PKG_ROOT = join(__dirname, "..");
 const LABEL = "com.ricotrevisan.hermes-claude-bridge";
 const DEFAULT_PORT = "8787";
 const ENV_KEY = "CLAUDE_BRIDGE_API_KEY";
-const ENV_VALUE = "claude-code-subscription";
+// The value 0.1.x installs wrote when the server still ignored the header.
+const LEGACY_PLACEHOLDER = "claude-code-subscription";
 const PACKAGE_JSON = JSON.parse(readFileSync(join(PKG_ROOT, "package.json"), "utf8"));
 const AGENT_SDK_VERSION = PACKAGE_JSON.dependencies?.["@anthropic-ai/claude-agent-sdk"];
 if (!/^\d+\.\d+\.\d+$/.test(AGENT_SDK_VERSION ?? "")) {
@@ -131,20 +135,29 @@ function writePlugin(pluginDir, port, link) {
 	writeFileSync(join(pluginDir, "plugin.yaml"), readFileSync(join(PKG_ROOT, "plugin", "plugin.yaml"), "utf8"));
 }
 
-function ensureEnvKey() {
+// The bridge and Hermes share one secret: the server validates it as a bearer
+// token, Hermes sends it via key_env. Reuse an existing real token so a re-run
+// doesn't lock out a running Hermes session; replace the legacy placeholder.
+function ensureApiToken() {
 	const envPath = join(hermesHome(), ".env");
 	let lines = [];
 	if (existsSync(envPath)) {
 		lines = readFileSync(envPath, "utf8").split("\n");
-		if (lines.some((l) => l.trim().startsWith(`${ENV_KEY}=`))) {
-			return { envPath, added: false };
+		const existing = lines.find((l) => l.trim().startsWith(`${ENV_KEY}=`));
+		const value = existing?.trim().slice(ENV_KEY.length + 1).replace(/^["']|["']$/g, "");
+		if (value && value !== LEGACY_PLACEHOLDER) {
+			chmodSync(envPath, 0o600);
+			return { envPath, token: value, generated: false };
 		}
+		lines = lines.filter((l) => !l.trim().startsWith(`${ENV_KEY}=`));
 		if (lines.length && lines[lines.length - 1] !== "") lines.push("");
 	}
-	lines.push(`${ENV_KEY}=${ENV_VALUE}`);
+	const token = randomBytes(32).toString("hex");
+	lines.push(`${ENV_KEY}=${token}`);
 	if (lines[lines.length - 1] !== "") lines.push("");
 	writeFileSync(envPath, lines.join("\n"));
-	return { envPath, added: true };
+	chmodSync(envPath, 0o600);
+	return { envPath, token, generated: true };
 }
 
 // Add providers.claude-bridge to config.yaml (the system the `hermes model`
@@ -189,7 +202,7 @@ function ensureConfigProvider(port) {
 	return { configPath, existed };
 }
 
-function servicePath(node, stableServer, port, logFile) {
+function servicePath(node, stableServer, port, logFile, token) {
 	if (platform() === "darwin") {
 		// Include the install-time PATH so the spawned `claude` (nvm/mise/brew/
 		// npm-global) is discoverable, plus the usual fallbacks.
@@ -215,6 +228,7 @@ function servicePath(node, stableServer, port, logFile) {
   <dict>
     <key>PATH</key><string>${x(homePaths)}</string>
     <key>CLAUDE_BRIDGE_PORT</key><string>${x(port)}</string>
+    <key>${x(ENV_KEY)}</key><string>${x(token)}</string>
   </dict>
   <key>StandardOutPath</key><string>${x(logFile)}</string>
   <key>StandardErrorPath</key><string>${x(logFile)}</string>
@@ -236,6 +250,7 @@ After=network.target
 ExecStart="${node}" "${stableServer}"
 Environment=PATH=${linuxPath}
 Environment=CLAUDE_BRIDGE_PORT=${port}
+Environment=${ENV_KEY}=${token}
 WorkingDirectory=${homedir()}
 Restart=on-failure
 RestartSec=3
@@ -269,10 +284,12 @@ async function waitForPortFree(port, attempts = 20) {
 	}
 }
 
-async function installService(node, stableServer, port, logFile) {
-	const svc = servicePath(node, stableServer, port, logFile);
+async function installService(node, stableServer, port, logFile, token) {
+	const svc = servicePath(node, stableServer, port, logFile, token);
 	mkdirSync(dirname(svc.file), { recursive: true });
+	// The unit file carries the bearer token.
 	writeFileSync(svc.file, svc.contents);
+	chmodSync(svc.file, 0o600);
 
 	if (platform() === "darwin") {
 		const uid = process.getuid();
@@ -327,6 +344,18 @@ async function healthCheck(port, attempts = 40) {
 	return false;
 }
 
+// Confirms the running service got the same token Hermes will send.
+async function authCheck(port, token) {
+	try {
+		const res = await fetch(`http://127.0.0.1:${port}/v1/models`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		return res.ok;
+	} catch {
+		return false;
+	}
+}
+
 export async function install(argv) {
 	if (platform() === "win32") {
 		throw new Error(
@@ -343,7 +372,7 @@ export async function install(argv) {
 	console.log(`hermes-claude-bridge install — this will:
   • copy the bridge server to ${stableRuntimeDir()}
   • write a provider plugin to ${join(home, "plugins", "model-providers", "claude-bridge")}
-  • add a placeholder ${ENV_KEY} to ${join(home, ".env")} (the bridge ignores its value)
+  • add a random ${ENV_KEY} to ${join(home, ".env")} (the bridge requires it as a bearer token)
   • add providers.claude-bridge to ${join(home, "config.yaml")}${service ? `\n  • register a background auto-start service (${platform() === "darwin" ? "launchd" : "systemd --user"})` : ""}
   • install the Agent SDK runtime and force OAuth subscription auth for every turn
   (reverse all of this any time with: hermes-claude-bridge uninstall)
@@ -357,8 +386,8 @@ export async function install(argv) {
 	console.log(`• Plugin → ${pluginDir}${link ? " (symlinked)" : ""}`);
 	writePlugin(pluginDir, port, link);
 
-	const { envPath, added } = ensureEnvKey();
-	console.log(`• ${added ? "Wrote" : "Found"} ${ENV_KEY} in ${envPath} (placeholder — ignored)`);
+	const { envPath, token, generated } = ensureApiToken();
+	console.log(`• ${generated ? "Generated" : "Reused"} ${ENV_KEY} in ${envPath} (bearer token — keep it secret)`);
 
 	const { configPath, existed } = ensureConfigProvider(port);
 	console.log(`• ${existed ? "Updated" : "Added"} providers.claude-bridge in ${configPath}`);
@@ -369,15 +398,21 @@ export async function install(argv) {
 
 	if (service) {
 		console.log(`• Registering auto-start service (port ${port})…`);
-		const { svcFile, activated } = await installService(node, stableServer, port, logFile);
+		const { svcFile, activated } = await installService(node, stableServer, port, logFile, token);
 		console.log(`• Service: ${svcFile}`);
 		console.log(`• Logs: ${logFile}`);
 		if (activated) {
 			const ok = await healthCheck(port);
 			console.log(ok ? `• Bridge is up on http://127.0.0.1:${port}` : "• ⚠️  Bridge did not answer /healthz yet — check the log.");
+			if (ok && !(await authCheck(port, token))) {
+				console.log(`• ⚠️  The running bridge rejected the ${ENV_KEY} in ${envPath} — an older instance may still hold the port.`);
+			}
 		}
 	} else {
-		console.log("• Skipped service (--no-service). Run it with: hermes-claude-bridge start  (or: npm run dev)");
+		console.log(
+			"• Skipped service (--no-service). Run it with the token in the environment:\n" +
+				`      export $(grep -m1 '^${ENV_KEY}=' ${envPath}) && hermes-claude-bridge start`,
+		);
 	}
 
 	console.log(`
@@ -391,7 +426,7 @@ Next steps:
   3. Chat as usual — Agent SDK turns run on your Claude subscription (no API key).
 
 Notes:
-  • The bridge listens on 127.0.0.1:${port} and is reachable only locally.
+  • The bridge listens on 127.0.0.1:${port}, only locally, and only for callers that send the ${ENV_KEY} bearer token.
   • The Agent SDK runtime includes a platform-specific Claude Code executable (~200 MB).
   • Re-run install after upgrading the package to refresh the stable runtime copy.
   • Uninstall with: hermes-claude-bridge uninstall`);

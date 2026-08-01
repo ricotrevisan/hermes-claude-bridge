@@ -5,11 +5,9 @@ Declarative ProviderProfile only — it points Hermes at the local bridge server
 subscription). Hermes reaches it over plain chat_completions HTTP; the bridge
 owns the SDK subprocess lifecycle.
 
-The bridge ignores authentication: requests to a localhost base_url with no key
-get a "no-key-required" placeholder from Hermes, exactly like a local Ollama /
-llama.cpp endpoint. CLAUDE_BRIDGE_API_KEY is declared only so Hermes registers
-this provider for `hermes model` selection — leave it unset; the bridge never
-reads it.
+CLAUDE_BRIDGE_API_KEY is a real credential: the installer generates a random
+per-install token, and the bridge rejects any request whose Authorization
+bearer token does not match it.
 
 Port resolution: defaults to 8787, overridable via CLAUDE_BRIDGE_PORT. The
 installer bakes the chosen port into base_url for service installs; for the
@@ -59,7 +57,7 @@ register_provider(
         api_mode="chat_completions",
         base_url=f"http://127.0.0.1:{_PORT}/v1",
         auth_type="api_key",
-        env_vars=("CLAUDE_BRIDGE_API_KEY",),  # optional/ignored; enables registration only
+        env_vars=("CLAUDE_BRIDGE_API_KEY",),  # per-install bearer token, validated by the bridge
         supports_health_check=True,  # bridge implements GET /v1/models
         supports_vision=True,  # Claude is multimodal; the bridge passes images through
         fallback_models=(

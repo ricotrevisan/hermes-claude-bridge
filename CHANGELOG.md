@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## Unreleased
 
+- Authenticated the local endpoint ([#9](https://github.com/ricotrevisan/hermes-claude-bridge/issues/9)):
+  the installer now generates a random per-install `CLAUDE_BRIDGE_API_KEY` instead of a
+  placebo placeholder, the server validates it as a bearer token on every route except
+  `/healthz`, and it refuses to start without one.
+- Hardened full-agent mode: `CLAUDE_BRIDGE_*` variables are stripped from the SDK child
+  environment, and the default working directory is `~/.hermes/claude-bridge-workspace`
+  instead of `$HOME`.
+- Added header and request-body timeouts so a stalled client cannot hold a connection open.
+
 ## [0.2.0] - 2026-07-30
 
 - Revived the bridge using Claude Agent SDK `query()` now that Agent SDK turns

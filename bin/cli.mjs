@@ -55,7 +55,7 @@ switch (cmd) {
 		const portFlag = rest.indexOf("--port");
 		if (portFlag !== -1 && rest[portFlag + 1]) process.env.CLAUDE_BRIDGE_PORT = rest[portFlag + 1];
 		const { startServer } = await import(join(__dirname, "..", "dist", "server.js"));
-		startServer();
+		await run(() => startServer());
 		break;
 	}
 	case "help":

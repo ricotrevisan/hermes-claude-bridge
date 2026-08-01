@@ -5,6 +5,8 @@ import { once } from "node:events";
 import { createBridgeServer, type BridgeRunner } from "./server.js";
 import type { BridgeEvent } from "./bridge.js";
 
+const TOKEN = "test-bridge-token";
+
 async function withServer(
 	events: BridgeEvent[],
 	run: (baseUrl: string) => Promise<void>,
@@ -14,7 +16,7 @@ async function withServer(
 		onRun?.(options);
 		for (const event of events) yield event;
 	}) as BridgeRunner;
-	const server = createBridgeServer(runner);
+	const server = createBridgeServer(runner, TOKEN);
 	server.listen(0, "127.0.0.1");
 	await once(server, "listening");
 	const port = (server.address() as AddressInfo).port;
@@ -31,6 +33,8 @@ const requestBody = JSON.stringify({
 	messages: [{ role: "user", content: "hello" }],
 });
 
+const authHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` };
+
 test("HTTP edge serves context metadata and sends the measured runtime model", async () => {
 	let runtimeModel: string | undefined;
 	await withServer([
@@ -42,7 +46,7 @@ test("HTTP edge serves context metadata and sends the measured runtime model", a
 			status: "ok",
 			service: "hermes-claude-bridge",
 		});
-		const models: any = await (await fetch(`${baseUrl}/v1/models`)).json();
+		const models: any = await (await fetch(`${baseUrl}/v1/models`, { headers: authHeaders })).json();
 		assert.equal(models.data.length, 8);
 		assert.equal(models.data[0].id, "claude-fable-5");
 		assert.equal(models.data[0].context_window, 1_000_000);
@@ -50,7 +54,7 @@ test("HTTP edge serves context metadata and sends the measured runtime model", a
 
 		const response = await fetch(`${baseUrl}/v1/chat/completions`, {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
+			headers: authHeaders,
 			body: requestBody,
 		});
 		assert.equal(response.status, 200);
@@ -72,7 +76,7 @@ test("streaming response preserves Hermes' required SSE frame order", async () =
 	], async (baseUrl) => {
 		const response = await fetch(`${baseUrl}/v1/chat/completions`, {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
+			headers: authHeaders,
 			body: JSON.stringify({ ...JSON.parse(requestBody), stream: true }),
 		});
 		assert.equal(response.status, 200);
@@ -88,13 +92,36 @@ test("streaming response preserves Hermes' required SSE frame order", async () =
 	});
 });
 
+test("HTTP edge requires the per-install bearer token on every quota-spending route", async () => {
+	let runnerStarted = false;
+	await withServer([], async (baseUrl) => {
+		const rejected = [
+			{ name: "missing", headers: { "Content-Type": "application/json" } },
+			{ name: "wrong token", headers: { "Content-Type": "application/json", Authorization: "Bearer nope" } },
+			{ name: "prefix of the token", headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN.slice(0, -1)}` } },
+			{ name: "wrong scheme", headers: { "Content-Type": "application/json", Authorization: `Basic ${TOKEN}` } },
+		];
+		for (const { name, headers } of rejected) {
+			const completions = await fetch(`${baseUrl}/v1/chat/completions`, { method: "POST", headers, body: requestBody });
+			assert.equal(completions.status, 401, name);
+			assert.equal((await completions.json() as any).error.type, "authentication_error", name);
+			assert.equal((await fetch(`${baseUrl}/v1/models`, { headers })).status, 401, name);
+		}
+		// Liveness carries no user content and spends no quota, so it stays open.
+		assert.equal((await fetch(`${baseUrl}/healthz`)).status, 200);
+		assert.equal(runnerStarted, false);
+	}, () => {
+		runnerStarted = true;
+	});
+});
+
 test("HTTP edge rejects models outside the measured catalog before starting Claude", async () => {
 	let runnerStarted = false;
 	await withServer([], async (baseUrl) => {
 		for (const model of ["claude-sonnet-4-6[1m]", "future-model", "__proto__", "constructor"]) {
 			const response = await fetch(`${baseUrl}/v1/chat/completions`, {
 				method: "POST",
-				headers: { "Content-Type": "application/json" },
+				headers: authHeaders,
 				body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
 			});
 
@@ -117,21 +144,21 @@ test("HTTP edge rejects browser-origin, non-JSON, and malformed model requests",
 	await withServer([], async (baseUrl) => {
 		const browser = await fetch(`${baseUrl}/v1/chat/completions`, {
 			method: "POST",
-			headers: { Origin: "https://attacker.example", "Content-Type": "text/plain" },
+			headers: { ...authHeaders, Origin: "https://attacker.example", "Content-Type": "text/plain" },
 			body: requestBody,
 		});
 		assert.equal(browser.status, 403);
 
 		const nonJson = await fetch(`${baseUrl}/v1/chat/completions`, {
 			method: "POST",
-			headers: { "Content-Type": "text/plain" },
+			headers: { ...authHeaders, "Content-Type": "text/plain" },
 			body: requestBody,
 		});
 		assert.equal(nonJson.status, 415);
 
 		const badModel = await fetch(`${baseUrl}/v1/chat/completions`, {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
+			headers: authHeaders,
 			body: JSON.stringify({ model: 42, messages: [{ role: "user", content: "hi" }] }),
 		});
 		assert.equal(badModel.status, 400);
@@ -150,7 +177,7 @@ test("HTTP edge maps subscription failures without forwarding arbitrary status c
 			await withServer([item.event], async (baseUrl) => {
 				const response = await fetch(`${baseUrl}/v1/chat/completions`, {
 					method: "POST",
-					headers: { "Content-Type": "application/json" },
+					headers: authHeaders,
 					body: requestBody,
 				});
 				assert.equal(response.status, item.expected);
@@ -166,11 +193,21 @@ test("buffered responses fail instead of returning truncated partial output", as
 	], async (baseUrl) => {
 		const response = await fetch(`${baseUrl}/v1/chat/completions`, {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
+			headers: authHeaders,
 			body: requestBody,
 		});
 		assert.equal(response.status, 502);
 		const body: any = await response.json();
 		assert.match(body.error.message, /upstream broke/);
 	});
+});
+
+test("a tokenless server refuses to start instead of serving unauthenticated", () => {
+	assert.throws(() => createBridgeServer(undefined, ""), /CLAUDE_BRIDGE_API_KEY/);
+});
+
+test("header and body reads are bounded so a stalled client cannot hold a connection", () => {
+	const server = createBridgeServer(undefined, TOKEN);
+	assert.ok(server.headersTimeout > 0);
+	assert.ok(server.requestTimeout > 0 && server.requestTimeout > server.headersTimeout);
 });

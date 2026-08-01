@@ -7,9 +7,13 @@
 //
 // Binds to 127.0.0.1 only. Port from CLAUDE_BRIDGE_PORT (default 8787) — this
 // MUST match the Hermes plugin's base_url (the installer templates both).
+//
+// Every quota-spending route requires the per-install CLAUDE_BRIDGE_API_KEY as
+// a bearer token, so a localhost bind is not the only thing standing between
+// another local process and the Claude subscription.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { runClaude, describeError, type BridgeEvent } from "./bridge.js";
@@ -31,6 +35,8 @@ import type { OpenAIMessage } from "./convert.js";
 import { expectedContextWindow, MODEL_IDS, resolveModel, runtimeModelId } from "./models.js";
 
 const DEFAULT_PORT = 8787;
+const HEADERS_TIMEOUT_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 120_000;
 
 function newId(): string {
 	return "chatcmpl-" + randomBytes(12).toString("hex");
@@ -76,6 +82,14 @@ function modelsResponse(): unknown {
 }
 
 export type BridgeRunner = typeof runClaude;
+
+function hasBearerToken(req: IncomingMessage, token: string): boolean {
+	const header = req.headers.authorization ?? "";
+	if (!/^bearer /i.test(header)) return false;
+	// Digest first so the comparison is constant-time regardless of length.
+	const presented = createHash("sha256").update(header.slice(7).trim()).digest();
+	return timingSafeEqual(presented, createHash("sha256").update(token).digest());
+}
 
 function errorHttpStatus(event: Extract<BridgeEvent, { type: "error" }>): number {
 	if (event.status === "authentication_failed") return 401;
@@ -273,12 +287,17 @@ async function bufferResponse(
 	);
 }
 
-function handler(req: IncomingMessage, res: ServerResponse, runner: BridgeRunner): void {
+function handler(req: IncomingMessage, res: ServerResponse, runner: BridgeRunner, token: string): void {
 	const url = (req.url ?? "").split("?")[0];
 	const method = req.method ?? "GET";
 
+	// Liveness only; it exposes no user content and spends no quota.
 	if (method === "GET" && (url === "/healthz" || url === "/health")) {
 		sendJson(res, 200, { status: "ok", service: "hermes-claude-bridge" });
+		return;
+	}
+	if (!hasBearerToken(req, token)) {
+		sendError(res, 401, "missing or invalid bearer token (CLAUDE_BRIDGE_API_KEY)", "authentication_error");
 		return;
 	}
 	if (method === "GET" && (url === "/v1/models" || url === "/models")) {
@@ -297,8 +316,22 @@ function handler(req: IncomingMessage, res: ServerResponse, runner: BridgeRunner
 	sendError(res, 404, `no route for ${method} ${url}`, "not_found");
 }
 
-export function createBridgeServer(runner: BridgeRunner = runClaude): ReturnType<typeof createServer> {
-	return createServer((req, res) => handler(req, res, runner));
+export function createBridgeServer(
+	runner: BridgeRunner = runClaude,
+	token = process.env.CLAUDE_BRIDGE_API_KEY,
+): ReturnType<typeof createServer> {
+	if (!token) {
+		throw new Error(
+			"CLAUDE_BRIDGE_API_KEY is not set. The bridge refuses to serve unauthenticated requests — " +
+				"run `hermes-claude-bridge install` to provision a token, or export the one in ~/.hermes/.env.",
+		);
+	}
+	const server = createServer((req, res) => handler(req, res, runner, token));
+	// Slow-loris hardening: cap how long a client may take to send headers and
+	// the request body. Neither bounds the (possibly long) SSE response.
+	server.headersTimeout = HEADERS_TIMEOUT_MS;
+	server.requestTimeout = REQUEST_TIMEOUT_MS;
+	return server;
 }
 
 export function startServer(port = Number(process.env.CLAUDE_BRIDGE_PORT) || DEFAULT_PORT): ReturnType<typeof createServer> {
@@ -330,5 +363,10 @@ function isMainModule(): boolean {
 }
 
 if (isMainModule()) {
-	startServer();
+	try {
+		startServer();
+	} catch (err) {
+		console.error(`hermes-claude-bridge: ${err instanceof Error ? err.message : String(err)}`);
+		process.exit(1);
+	}
 }

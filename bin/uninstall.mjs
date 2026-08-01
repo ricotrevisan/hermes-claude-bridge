@@ -8,7 +8,6 @@ import { parseDocument } from "yaml";
 
 const LABEL = "com.ricotrevisan.hermes-claude-bridge";
 const ENV_KEY = "CLAUDE_BRIDGE_API_KEY";
-const ENV_VALUE = "claude-code-subscription"; // the placeholder the installer writes
 
 function hermesHome() {
 	return process.env.HERMES_HOME || join(homedir(), ".hermes");
@@ -33,13 +32,11 @@ function removeEnvKey() {
 	const envPath = join(hermesHome(), ".env");
 	if (!existsSync(envPath)) return;
 	const lines = readFileSync(envPath, "utf8").split("\n");
-	// Only remove OUR placeholder — never delete a value the user set themselves.
-	const kept = lines.filter((l) => l.trim() !== `${ENV_KEY}=${ENV_VALUE}`);
+	// The token only ever authenticates this bridge, so it is dead weight now.
+	const kept = lines.filter((l) => !l.trim().startsWith(`${ENV_KEY}=`));
 	if (kept.length !== lines.length) {
 		writeFileSync(envPath, kept.join("\n"));
-		console.log(`• Removed placeholder ${ENV_KEY} from ${envPath}`);
-	} else if (lines.some((l) => l.trim().startsWith(`${ENV_KEY}=`))) {
-		console.log(`• Left ${ENV_KEY} in ${envPath} (value isn't our placeholder — you set it). Remove it manually if unwanted.`);
+		console.log(`• Removed ${ENV_KEY} from ${envPath}`);
 	}
 }
 

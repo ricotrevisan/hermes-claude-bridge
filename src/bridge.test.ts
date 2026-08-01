@@ -124,6 +124,10 @@ test("clean mode calls query with an isolated one-turn OAuth subscription config
 		assert.equal("CLAUDE_CODE_USE_BEDROCK" in params.options.env, false);
 		assert.equal("CLAUDE_CODE_USE_VERTEX" in params.options.env, false);
 		assert.equal("ANTHROPIC_VERTEX_PROJECT_ID" in params.options.env, false);
+		// A prompt-injected turn must not read the bridge's own token or reconfigure it.
+		assert.equal("CLAUDE_BRIDGE_CLAUDE_BIN" in params.options.env, false);
+		assert.equal("CLAUDE_BRIDGE_FULL_AGENT" in params.options.env, false);
+		assert.equal("CLAUDE_BRIDGE_API_KEY" in params.options.env, false);
 		assert.equal(params.options.env.ENABLE_CLAUDEAI_MCP_SERVERS, "0");
 		assert.equal(params.options.env.DISABLE_AUTO_COMPACT, "1");
 		assert.equal(params.options.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, "1");
@@ -194,6 +198,7 @@ test("full-agent mode uses Claude Code tools but still suppresses settings and M
 			],
 			{
 				model: "test",
+				cwd: "/tmp",
 				queryFn: ((value: any) => {
 					params = value;
 					return fakeQuery([init(), result()]);
@@ -210,9 +215,36 @@ test("full-agent mode uses Claude Code tools but still suppresses settings and M
 		assert.equal(params.options.strictMcpConfig, true);
 		assert.deepEqual(params.options.settingSources, []);
 		assert.equal(params.options.env.ENABLE_CLAUDEAI_MCP_SERVERS, "0");
+		assert.equal("CLAUDE_BRIDGE_FULL_AGENT" in params.options.env, false);
 	} finally {
 		if (previous === undefined) delete process.env.CLAUDE_BRIDGE_FULL_AGENT;
 		else process.env.CLAUDE_BRIDGE_FULL_AGENT = previous;
+	}
+});
+
+test("full-agent mode works in a dedicated workspace instead of the home directory", async () => {
+	const previous = { full: process.env.CLAUDE_BRIDGE_FULL_AGENT, home: process.env.HERMES_HOME };
+	const hermesHome = await mkdtemp(join(tmpdir(), "bridge-home-"));
+	process.env.CLAUDE_BRIDGE_FULL_AGENT = "1";
+	process.env.HERMES_HOME = hermesHome;
+	let params: any;
+	try {
+		await collect([{ role: "user", content: "hi" }], {
+			model: "test",
+			queryFn: ((value: any) => {
+				params = value;
+				return fakeQuery([init(), result()]);
+			}) as any,
+		});
+		const workspace = join(hermesHome, "claude-bridge-workspace");
+		assert.equal(params.options.cwd, workspace);
+		assert.deepEqual(await readdir(workspace), []);
+	} finally {
+		if (previous.full === undefined) delete process.env.CLAUDE_BRIDGE_FULL_AGENT;
+		else process.env.CLAUDE_BRIDGE_FULL_AGENT = previous.full;
+		if (previous.home === undefined) delete process.env.HERMES_HOME;
+		else process.env.HERMES_HOME = previous.home;
+		await rm(hermesHome, { recursive: true, force: true });
 	}
 });
 
