@@ -285,6 +285,7 @@ export async function* runClaude(
 	let failed = false;
 	let subscriptionAccount = false;
 	let authenticated = false;
+	let completed = false;
 	let sawText = false;
 	let sawRateLimitInfo = false;
 	let stopReason: string | null = null;
@@ -352,11 +353,16 @@ export async function* runClaude(
 				continue;
 			}
 
-			// The SDK emits init before any turn output. Refuse to forward or
-			// trigger further iteration until OAuth has been verified.
+			// The SDK emits init before any turn output. Account metadata already
+			// proved the subscription, so output ahead of init is a broken
+			// transport rather than evidence of the wrong credentials.
 			if (!authenticated) {
 				failed = true;
-				yield errorEvent("Claude Agent SDK did not initialize with OAuth authentication.", "authentication_failed");
+				yield errorEvent(
+					"Claude Agent SDK streamed output before reporting session initialization; refusing the turn.",
+					"transport_error",
+					502,
+				);
 				break;
 			}
 
@@ -429,6 +435,7 @@ export async function* runClaude(
 					sawText = true;
 					yield { type: "text", delta: message.result };
 				}
+				completed = true;
 			}
 		}
 
@@ -440,9 +447,15 @@ export async function* runClaude(
 			}
 		}
 
-		if (!aborted && !failed && !authenticated) {
+		// Without a terminal result the turn was cut short — an empty or truncated
+		// stream must not be reported to Hermes as a completed answer.
+		if (!aborted && !failed && !completed) {
 			failed = true;
-			yield errorEvent("Claude Agent SDK ended without OAuth authentication initialization.", "authentication_failed");
+			yield errorEvent(
+				"Claude Agent SDK stream ended before returning a result; the Claude Code transport failed mid-turn.",
+				"transport_error",
+				502,
+			);
 		}
 	} catch (error) {
 		if (!aborted) {

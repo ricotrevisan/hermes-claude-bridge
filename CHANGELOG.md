@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## Unreleased
 
+- Fixed truncated SDK streams reporting success
+  ([#8](https://github.com/ricotrevisan/hermes-claude-bridge/issues/8)): a stream that ends
+  without a terminal result now fails the turn instead of finishing cleanly — 502 before
+  streaming starts, and the usual in-band `[bridge error]` notice once it has. A transport that
+  dies before the SDK's init message no longer misreports as a 401 telling the user to run
+  `claude login`.
+
 - Authenticated the local endpoint ([#9](https://github.com/ricotrevisan/hermes-claude-bridge/issues/9)):
   the installer now generates a random per-install `CLAUDE_BRIDGE_API_KEY` instead of a
   placebo placeholder, the server validates it as a bearer token on every route except

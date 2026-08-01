@@ -475,6 +475,33 @@ test("SDK iteration errors become bridge errors and the query is closed", async 
 	assert.equal(closes, 1);
 });
 
+test("a turn without a terminal result fails upstream instead of reporting success or a login prompt", async (t) => {
+	const partialText = {
+		type: "stream_event",
+		event: { type: "content_block_delta", delta: { type: "text_delta", text: "partial" } },
+	};
+	const cases = [
+		{ name: "init only", messages: [init()] },
+		{ name: "partial text then EOF", messages: [init(), partialText] },
+		{ name: "zero messages after a verified account", messages: [] },
+		{ name: "output before init", messages: [{ type: "assistant", message: { content: [{ type: "text", text: "early" }] } }, result()] },
+	];
+	for (const item of cases) {
+		await t.test(item.name, async () => {
+			const events = await collect([{ role: "user", content: "hi" }], {
+				model: "test",
+				queryFn: (() => fakeQuery(item.messages as any)) as any,
+			});
+			const last = events.at(-1) as any;
+			assert.equal(last.type, "error");
+			assert.equal(last.status, "transport_error");
+			assert.equal(last.httpStatus, 502);
+			assert.doesNotMatch(describeError(last.message, last.status), /claude login/);
+			assert.ok(!events.some((event) => event.type === "done"), "must not report success");
+		});
+	}
+});
+
 test("abort interrupts and closes an active query", async () => {
 	const controller = new AbortController();
 	let release!: () => void;
