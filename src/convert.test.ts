@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { repairToolPairing } from "cc-session-io";
 import { extractSystem, openaiMessagesToAnthropic, splitConversation } from "./convert.js";
 
 test("extractSystem joins system and developer messages with blank lines", () => {
@@ -57,6 +58,53 @@ test("openaiMessagesToAnthropic: tool role becomes a user tool_result", () => {
 			role: "user",
 			content: [{ type: "tool_result", tool_use_id: "call_1", content: "72F and sunny" }],
 		},
+	]);
+});
+
+test("openaiMessagesToAnthropic: parallel tool results coalesce into one user turn", () => {
+	const out = openaiMessagesToAnthropic([
+		{
+			role: "assistant",
+			tool_calls: [
+				{ id: "call_1", function: { name: "get_weather", arguments: "{}" } },
+				{ id: "call_2", function: { name: "get_time", arguments: "{}" } },
+			],
+		},
+		{ role: "tool", tool_call_id: "call_2", content: "12:00" },
+		{ role: "tool", tool_call_id: "call_1", content: "72F" },
+		{ role: "user", content: "thanks" },
+	]);
+
+	assert.deepEqual(out[1], {
+		role: "user",
+		content: [
+			{ type: "tool_result", tool_use_id: "call_2", content: "12:00" },
+			{ type: "tool_result", tool_use_id: "call_1", content: "72F" },
+		],
+	});
+	assert.deepEqual(out[2], { role: "user", content: "thanks" });
+});
+
+// repairToolPairing consumes a single user message per assistant tool turn, so
+// unmerged results are dropped and replaced by "[no tool result recorded]".
+test("parallel tool results survive repairToolPairing, in call order", () => {
+	const repaired = repairToolPairing(
+		openaiMessagesToAnthropic([
+			{
+				role: "assistant",
+				tool_calls: [
+					{ id: "call_1", function: { name: "get_weather", arguments: "{}" } },
+					{ id: "call_2", function: { name: "get_time", arguments: "{}" } },
+				],
+			},
+			{ role: "tool", tool_call_id: "call_2", content: "12:00" },
+			{ role: "tool", tool_call_id: "call_1", content: "72F" },
+		]),
+	);
+
+	assert.deepEqual(repaired[1].content, [
+		{ type: "tool_result", tool_use_id: "call_2", content: "12:00" },
+		{ type: "tool_result", tool_use_id: "call_1", content: "72F" },
 	]);
 });
 

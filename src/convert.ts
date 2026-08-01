@@ -147,21 +147,31 @@ function convertOne(m: OpenAIMessage): Message | null {
 		return { role: "assistant", content: blocks };
 	}
 
-	if (m.role === "tool") {
-		return {
-			role: "user",
-			content: [{ type: "tool_result", tool_use_id: m.tool_call_id ?? "", content: contentToText(m.content) }],
-		};
-	}
-
-	return null; // system/developer handled by extractSystem; unknown roles dropped
+	return null; // tool handled by openaiMessagesToAnthropic; system/developer by extractSystem
 }
 
-/** Convert all non-system OpenAI messages to Anthropic messages. */
+function toolResultBlock(m: OpenAIMessage): ContentBlock {
+	return { type: "tool_result", tool_use_id: m.tool_call_id ?? "", content: contentToText(m.content) };
+}
+
+/** Convert all non-system OpenAI messages to Anthropic messages.
+ *  OpenAI sends parallel tool results as consecutive `tool` messages, but
+ *  Anthropic expects one user turn carrying every tool_result block —
+ *  repairToolPairing pairs only the first user message after a tool call and
+ *  discards the rest, so the run must be merged here. */
 export function openaiMessagesToAnthropic(messages: OpenAIMessage[]): Message[] {
 	const out: Message[] = [];
-	for (const m of messages) {
+	for (let i = 0; i < messages.length; i++) {
+		const m = messages[i];
 		if (m.role === "system" || m.role === "developer") continue;
+
+		if (m.role === "tool") {
+			const blocks: ContentBlock[] = [toolResultBlock(m)];
+			while (messages[i + 1]?.role === "tool") blocks.push(toolResultBlock(messages[++i]));
+			out.push({ role: "user", content: blocks });
+			continue;
+		}
+
 		const converted = convertOne(m);
 		if (converted) out.push(converted);
 	}
