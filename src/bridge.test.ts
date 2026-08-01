@@ -57,6 +57,9 @@ test("clean mode calls query with an isolated one-turn OAuth subscription config
 		token: process.env.ANTHROPIC_AUTH_TOKEN,
 		legacyToken: process.env.ANTHROPIC_TOKEN,
 		base: process.env.ANTHROPIC_BASE_URL,
+		bedrock: process.env.CLAUDE_CODE_USE_BEDROCK,
+		vertex: process.env.CLAUDE_CODE_USE_VERTEX,
+		vertexProject: process.env.ANTHROPIC_VERTEX_PROJECT_ID,
 		bin: process.env.CLAUDE_BRIDGE_CLAUDE_BIN,
 		full: process.env.CLAUDE_BRIDGE_FULL_AGENT,
 	};
@@ -64,6 +67,9 @@ test("clean mode calls query with an isolated one-turn OAuth subscription config
 	process.env.ANTHROPIC_AUTH_TOKEN = "global-token";
 	process.env.ANTHROPIC_TOKEN = "legacy-global-token";
 	process.env.ANTHROPIC_BASE_URL = "https://example.invalid";
+	process.env.CLAUDE_CODE_USE_BEDROCK = "1";
+	process.env.CLAUDE_CODE_USE_VERTEX = "1";
+	process.env.ANTHROPIC_VERTEX_PROJECT_ID = "vertex-project";
 	process.env.CLAUDE_BRIDGE_CLAUDE_BIN = "/custom/claude";
 	delete process.env.CLAUDE_BRIDGE_FULL_AGENT;
 
@@ -115,6 +121,9 @@ test("clean mode calls query with an isolated one-turn OAuth subscription config
 		assert.equal("ANTHROPIC_AUTH_TOKEN" in params.options.env, false);
 		assert.equal("ANTHROPIC_TOKEN" in params.options.env, false);
 		assert.equal("ANTHROPIC_BASE_URL" in params.options.env, false);
+		assert.equal("CLAUDE_CODE_USE_BEDROCK" in params.options.env, false);
+		assert.equal("CLAUDE_CODE_USE_VERTEX" in params.options.env, false);
+		assert.equal("ANTHROPIC_VERTEX_PROJECT_ID" in params.options.env, false);
 		assert.equal(params.options.env.ENABLE_CLAUDEAI_MCP_SERVERS, "0");
 		assert.equal(params.options.env.DISABLE_AUTO_COMPACT, "1");
 		assert.equal(params.options.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, "1");
@@ -129,6 +138,9 @@ test("clean mode calls query with an isolated one-turn OAuth subscription config
 			["ANTHROPIC_AUTH_TOKEN", previous.token],
 			["ANTHROPIC_TOKEN", previous.legacyToken],
 			["ANTHROPIC_BASE_URL", previous.base],
+			["CLAUDE_CODE_USE_BEDROCK", previous.bedrock],
+			["CLAUDE_CODE_USE_VERTEX", previous.vertex],
+			["ANTHROPIC_VERTEX_PROJECT_ID", previous.vertexProject],
 			["CLAUDE_BRIDGE_CLAUDE_BIN", previous.bin],
 			["CLAUDE_BRIDGE_FULL_AGENT", previous.full],
 		] as const) {
@@ -261,6 +273,35 @@ test("rejects an SDK account that is not a first-party Claude subscription", asy
 		status: "authentication_failed",
 		message: "Claude Agent SDK did not report a first-party Claude subscription account; refusing non-subscription execution.",
 	}]);
+});
+
+test("a missing API-key source is refused as unverifiable, not treated as a value", async () => {
+	const events = await collect([{ role: "user", content: "hi" }], {
+		model: "test",
+		queryFn: (() => fakeQuery([{ type: "system", subtype: "init" }, result()])) as any,
+	});
+	assert.equal(events.length, 1);
+	assert.equal(events[0].type, "error");
+	assert.equal((events[0] as any).status, "authentication_failed");
+	assert.match((events[0] as any).message, /did not report an API-key source/);
+});
+
+test("a rejected account never has its prompt consumed", async () => {
+	const consumed: any[] = [];
+	const events = await collect([{ role: "user", content: "secret prompt" }], {
+		model: "test",
+		queryFn: ((params: any) => {
+			void (async () => {
+				for await (const message of params.prompt) consumed.push(message);
+			})();
+			return fakeQuery([init(), result()], { account: { apiProvider: "bedrock" } });
+		}) as any,
+	});
+	assert.equal(events.length, 1);
+	assert.equal(events[0].type, "error");
+	assert.equal((events[0] as any).status, "authentication_failed");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(consumed, []);
 });
 
 test("normalizes result, assistant, and rejected rate-limit failures", async (t) => {

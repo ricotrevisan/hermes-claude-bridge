@@ -75,6 +75,11 @@ function childEnvironment(): NodeJS.ProcessEnv {
 	delete env.ANTHROPIC_AUTH_TOKEN;
 	delete env.ANTHROPIC_TOKEN;
 	delete env.ANTHROPIC_BASE_URL;
+	delete env.CLAUDE_CODE_USE_BEDROCK;
+	delete env.CLAUDE_CODE_USE_VERTEX;
+	for (const key of Object.keys(env)) {
+		if (key.startsWith("ANTHROPIC_VERTEX_")) delete env[key];
+	}
 	env.ENABLE_CLAUDEAI_MCP_SERVERS = "0";
 	env.DISABLE_AUTO_COMPACT = "1";
 	env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
@@ -203,8 +208,11 @@ function queryOptions(
 	};
 }
 
-function livePrompt(content: unknown): AsyncIterable<SDKUserMessage> {
+// Billing safety: the prompt stays parked until account metadata has been
+// validated, so a rejected query never dispatches user content to a backend.
+function gatedPrompt(content: unknown, released: Promise<boolean>): AsyncIterable<SDKUserMessage> {
 	return (async function* () {
+		if (!(await released)) return;
 		yield {
 			type: "user",
 			message: { role: "user", content } as SDKUserMessage["message"],
@@ -226,6 +234,10 @@ export async function* runClaude(
 	let session: ReturnType<typeof createSession> | null = null;
 	let activeQuery: Query | null = null;
 	let aborted = opts.signal?.aborted ?? false;
+	let releasePrompt: (send: boolean) => void = () => {};
+	const promptGate = new Promise<boolean>((resolve) => {
+		releasePrompt = resolve;
+	});
 	let failed = false;
 	let subscriptionAccount = false;
 	let authenticated = false;
@@ -265,7 +277,7 @@ export async function* runClaude(
 
 		const content = promptBlocks ?? (promptText || "[continue]");
 		activeQuery = (opts.queryFn ?? sdkQuery)({
-			prompt: livePrompt(content),
+			prompt: gatedPrompt(content, promptGate),
 			options: queryOptions(cwd, resumeSessionId, opts),
 		});
 
@@ -282,6 +294,7 @@ export async function* runClaude(
 			);
 			return;
 		}
+		releasePrompt(true);
 
 		for await (const message of activeQuery) {
 			if (aborted) break;
@@ -289,12 +302,14 @@ export async function* runClaude(
 			if (message.type === "system" && message.subtype === "init") {
 				// Claude Code currently reports "none" for a valid Keychain-backed
 				// claude.ai login. Explicit API-key sources are never accepted.
-				const source = message.apiKeySource as string;
+				const source = message.apiKeySource as string | undefined;
 				authenticated = subscriptionAccount && (source === "oauth" || source === "none");
 				if (!authenticated) {
 					failed = true;
 					yield errorEvent(
-						`Claude Agent SDK reported API-key source '${source}'; refusing non-subscription billing.`,
+						source === undefined
+							? "Claude Agent SDK did not report an API-key source; refusing unverifiable billing."
+							: `Claude Agent SDK reported API-key source '${source}'; refusing non-subscription billing.`,
 						"authentication_failed",
 					);
 					break;
@@ -403,6 +418,7 @@ export async function* runClaude(
 			);
 		}
 	} finally {
+		releasePrompt(false);
 		if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
 		if (activeQuery) {
 			try {
