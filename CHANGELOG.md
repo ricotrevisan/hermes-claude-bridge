@@ -14,6 +14,10 @@ All notable changes to this project are documented here. The format is based on
   environment, and the default working directory is `~/.hermes/claude-bridge-workspace`
   instead of `$HOME`.
 - Added header and request-body timeouts so a stalled client cannot hold a connection open.
+- Stopped writing replay history into the user's real `~/.claude/projects/`
+  ([#6](https://github.com/ricotrevisan/hermes-claude-bridge/issues/6)): history is kept in
+  memory and resumed through the Agent SDK's `sessionStore` adapter, so a bridge turn can no
+  longer leave a ghost session in the interactive `claude --resume` picker.
 
 ## [0.2.0] - 2026-07-30
 

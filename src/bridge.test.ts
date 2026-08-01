@@ -508,11 +508,11 @@ test("abort interrupts and closes an active query", async () => {
 	assert.ok(closes >= 1);
 });
 
-test("history is replayed through a temporary cc-session-io session and deleted", async () => {
+test("history is replayed through an in-memory session store, never the user's claude dir", async () => {
 	const claudeDir = await mkdtemp(join(tmpdir(), "hermes-bridge-test-"));
 	const previous = process.env.CLAUDE_CONFIG_DIR;
 	process.env.CLAUDE_CONFIG_DIR = claudeDir;
-	let resume: string | undefined;
+	let options: any;
 	try {
 		await collect(
 			[
@@ -524,19 +524,26 @@ test("history is replayed through a temporary cc-session-io session and deleted"
 				model: "test",
 				cwd: claudeDir,
 				queryFn: ((params: any) => {
-					resume = params.options.resume;
+					options = params.options;
 					return fakeQuery([init(), result()]);
 				}) as any,
 			},
 		);
-		assert.match(resume ?? "", /^[0-9a-f-]{36}$/);
-		const projectDirs = await readdir(join(claudeDir, "projects"));
-		for (const projectDir of projectDirs) {
-			assert.deepEqual(await readdir(join(claudeDir, "projects", projectDir)), []);
-		}
+		assert.match(options.resume, /^[0-9a-f-]{36}$/);
+		assert.equal(options.persistSession, undefined);
+
+		const entries = await options.sessionStore.load({ projectKey: "any", sessionId: options.resume });
+		assert.deepEqual(
+			entries.map((entry: any) => entry.message.content),
+			["earlier", [{ type: "text", text: "reply" }]],
+		);
+		assert.equal(await options.sessionStore.load({ projectKey: "any", sessionId: "other" }), null);
+
+		assert.deepEqual(await readdir(claudeDir), []);
 	} finally {
 		if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
 		else process.env.CLAUDE_CONFIG_DIR = previous;
 		await rm(claudeDir, { recursive: true, force: true });
 	}
 });
+

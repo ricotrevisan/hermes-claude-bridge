@@ -1,9 +1,9 @@
 // Claude Agent SDK driver for the bridge.
 //
-// Inbound OpenAI history is replayed through a temporary cc-session-io session,
-// while the trailing user turn is sent to the SDK as streaming input. The SDK's
-// query is deliberately isolated from API-key auth, local settings, MCP, hooks,
-// and skills. Full-agent mode changes only the system/tool/permission preset.
+// Inbound OpenAI history is replayed through an in-memory session store, while
+// the trailing user turn is sent to the SDK as streaming input. The SDK's query
+// is deliberately isolated from API-key auth, local settings, MCP, hooks, and
+// skills. Full-agent mode changes only the system/tool/permission preset.
 
 import {
 	query as sdkQuery,
@@ -11,8 +11,10 @@ import {
 	type Options as ClaudeQueryOptions,
 	type Query,
 	type SDKUserMessage,
+	type SessionStore,
+	type SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
-import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
+import { createSession, repairToolPairing, type Message } from "cc-session-io";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -179,9 +181,34 @@ function ensureFullAgentWorkspace(): string {
 	return dir;
 }
 
+type Replay = { sessionId: string; store: SessionStore };
+
+// Replay history must never reach the user's real ~/.claude/projects: a session
+// left there is visible in `claude --resume` and survives a hard kill. Handing
+// the SDK a store instead makes it materialize the transcript into its own temp
+// CLAUDE_CONFIG_DIR and delete it when the child exits.
+function replayFromHistory(history: Message[], cwd: string, model: string): Replay | null {
+	const session = createSession({ projectPath: cwd, model });
+	session.importMessages(repairToolPairing(history));
+	const entries = session.records as unknown as SessionStoreEntry[];
+	// A store that loads nothing makes the SDK drop the resume and fall back to a
+	// persisted session in the user's real claude dir. History that repairs away
+	// to nothing must take the persistSession: false path instead.
+	if (entries.length === 0) return null;
+	return {
+		sessionId: session.sessionId,
+		store: {
+			async append() {},
+			async load(key) {
+				return key.sessionId === session.sessionId ? entries : null;
+			},
+		},
+	};
+}
+
 function queryOptions(
 	cwd: string,
-	resume: string | undefined,
+	replay: Replay | null,
 	opts: RunOptions,
 ): ClaudeQueryOptions {
 	const fullAgent = fullAgentMode();
@@ -200,7 +227,7 @@ function queryOptions(
 		hooks: {},
 		settings: { disableAllHooks: true },
 		...(effort ? { effort } : {}),
-		...(resume ? { resume } : { persistSession: false }),
+		...(replay ? { resume: replay.sessionId, sessionStore: replay.store } : { persistSession: false }),
 		...(executable ? { pathToClaudeCodeExecutable: executable } : {}),
 	};
 
@@ -249,7 +276,6 @@ export async function* runClaude(
 ): AsyncGenerator<BridgeEvent> {
 	const cwd = opts.cwd || process.env.CLAUDE_BRIDGE_CWD || (fullAgentMode() ? ensureFullAgentWorkspace() : process.cwd());
 	const { history, promptText, promptBlocks } = splitConversation(messages);
-	let session: ReturnType<typeof createSession> | null = null;
 	let activeQuery: Query | null = null;
 	let aborted = opts.signal?.aborted ?? false;
 	let releasePrompt: (send: boolean) => void = () => {};
@@ -280,24 +306,14 @@ export async function* runClaude(
 	if (opts.signal) opts.signal.addEventListener("abort", onAbort, { once: true });
 
 	try {
-		let resumeSessionId: string | undefined;
-		if (history.length > 0) {
-			session = createSession({
-				projectPath: cwd,
-				claudeDir: process.env.CLAUDE_CONFIG_DIR,
-				model: opts.model,
-			});
-			session.importMessages(repairToolPairing(history));
-			session.save();
-			resumeSessionId = session.sessionId;
-		}
+		const replay = history.length > 0 ? replayFromHistory(history, cwd, opts.model) : null;
 
 		if (aborted) return;
 
 		const content = promptBlocks ?? (promptText || "[continue]");
 		activeQuery = (opts.queryFn ?? sdkQuery)({
 			prompt: gatedPrompt(content, promptGate),
-			options: queryOptions(cwd, resumeSessionId, opts),
+			options: queryOptions(cwd, replay, opts),
 		});
 
 		if (opts.signal?.aborted) onAbort();
@@ -446,13 +462,6 @@ export async function* runClaude(
 				activeQuery.close();
 			} catch {
 				// Best-effort cleanup.
-			}
-		}
-		if (session) {
-			try {
-				deleteSession(session.sessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
-			} catch {
-				// Temporary replay cleanup is best effort.
 			}
 		}
 	}

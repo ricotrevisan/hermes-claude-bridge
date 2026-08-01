@@ -85,10 +85,12 @@ The local server implements:
 
 For each request it:
 
-1. Converts OpenAI history to a temporary Claude Code session.
-2. Sends the trailing user turn through Agent SDK `query()`.
+1. Converts OpenAI history to a Claude Code transcript held in memory.
+2. Sends the trailing user turn through Agent SDK `query()`, resuming from that transcript via the SDK's `sessionStore` adapter.
 3. Streams text, reasoning, usage, stop reasons, and errors back as OpenAI-compatible output.
-4. Closes the SDK query and deletes the temporary session.
+4. Closes the SDK query.
+
+Replayed history never enters your real `~/.claude/projects/`. The SDK materializes the transcript into a private temporary directory for the child process and removes it when the child exits, so bridge turns never appear in your interactive `claude --resume` picker.
 
 The child environment removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_TOKEN`, `ANTHROPIC_BASE_URL`, and every `CLAUDE_BRIDGE_*` variable (including the bridge's own token). It also disables auto-loaded settings, skills, hooks, filesystem/cloud MCP servers, auto-memory, and auto-compaction in the default mode.
 
@@ -113,7 +115,7 @@ Hermes tool passthrough is deliberately outside the `0.2.0` scope. The proposed 
 | `CLAUDE_BRIDGE_CWD` | process working directory, or `~/.hermes/claude-bridge-workspace` in full-agent mode | Claude Code working directory. |
 | `CLAUDE_BRIDGE_CLAUDE_BIN` | SDK bundled executable | Override the Claude Code executable used by the SDK. |
 | `CLAUDE_BRIDGE_FULL_AGENT` | unset | Set to `1` for Claude Code's built-in agent tools. |
-| `CLAUDE_CONFIG_DIR` | Claude Code default | Alternate Claude Code credentials/session directory. |
+| `CLAUDE_CONFIG_DIR` | Claude Code default | Alternate Claude Code credentials/session directory. On macOS, setting this requires `~/.claude/.credentials.json` to exist in that directory; a Keychain-only login there cannot be replayed into the SDK's temporary session directory. |
 
 ## Development
 
