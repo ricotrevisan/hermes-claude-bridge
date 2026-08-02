@@ -42,10 +42,14 @@ Then choose **Claude Bridge** with `hermes model`, or from a running session:
 
 > Stock hermes-agent has a gap: `/model … --provider claude-bridge` and `hermes doctor`
 > resolve providers without consulting the plugin registry, so they reject plugin-only
-> providers that every picker happily shows. Until that lands upstream, apply
+> providers that every picker happily shows. Tracked upstream as
+> [NousResearch/hermes-agent#69576](https://github.com/NousResearch/hermes-agent/issues/69576),
+> fix pending in [PR #69993](https://github.com/NousResearch/hermes-agent/pull/69993).
+> Until that merges, apply
 > [`docs/patches/hermes-plugin-provider-resolution.patch`](./docs/patches/hermes-plugin-provider-resolution.patch)
 > to the hermes-agent checkout (keep it as an uncommitted working-tree change —
-> `hermes update` auto-stashes and restores it).
+> `hermes update` auto-stashes and restores it), and discard it once the upstream
+> fix lands.
 
 Uninstall everything created by the installer with:
 

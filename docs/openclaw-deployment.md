@@ -28,7 +28,12 @@ with the v0.2.0 bridge (commit `acde28a`, post-#10 installer) deployed. See
   `hermes doctor` accept plugin-only providers. Artifact:
   `docs/patches/hermes-plugin-provider-resolution.patch` in this repo; reapply
   with `git apply` if the checkout is ever reset. `hermes update` auto-stashes
-  and restores it (files untouched upstream). Upstreamable to NousResearch.
+  and restores it (files untouched upstream). Upstream: same bug is
+  NousResearch/hermes-agent#69576 with pending fix PR #69993 (same shape,
+  plus switch_model tests) — once that merges, DISCARD the local patch
+  (`git checkout -- hermes_cli/providers.py`, or skip the stash restore during
+  that `hermes update`) instead of restoring it, or the two blocks will
+  collide in the same function tail.
 - `providers.claude-bridge` was **removed from config.yaml** (2026-08-02, option
   B): the plugin registers the provider natively, the config entry only
   produced a duplicate picker row and `billing_provider: custom` labels.
