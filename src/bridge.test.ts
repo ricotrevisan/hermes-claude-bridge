@@ -487,6 +487,27 @@ test("overage wording in non-400 errors is not remapped to a non-retryable 402",
 	}
 });
 
+test("a thrown SDK 400 containing overage wording is not remapped without result api_error_status", async () => {
+	const error = Object.assign(new Error('The request quoted "out of extra usage" from the user'), { statusCode: 400 });
+	const query = (async function* () {
+		throw error;
+	})() as Query;
+	query.accountInfo = async () => ({ apiProvider: "firstParty", subscriptionType: "Claude Max" }) as any;
+	query.interrupt = async () => {};
+	query.close = () => {};
+
+	const events = await collect([{ role: "user", content: "hi" }], {
+		model: "test",
+		queryFn: (() => query) as any,
+	});
+
+	assert.deepEqual(events, [{
+		type: "error",
+		message: 'The request quoted "out of extra usage" from the user',
+		httpStatus: 400,
+	}]);
+});
+
 test("a successful turn without rate-limit metadata warns that overage state is unverified", async (t) => {
 	const warn = t.mock.method(console, "warn", () => {});
 	const events = await collect([{ role: "user", content: "hi" }], {

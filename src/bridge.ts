@@ -184,15 +184,6 @@ function assistantText(message: any): string {
 }
 
 function errorEvent(message: string, status?: string, httpStatus?: number | null): BridgeEvent {
-	// Claude can reject an overage fallback as an ordinary API 400 before it
-	// emits rate_limit_info. Preserve the billing meaning so Hermes does not
-	// retry a request that cannot run against the available subscription quota.
-	// Gate on the API status: quoted user content mentioning extra usage must
-	// not be remapped to a non-retryable 402.
-	if (httpStatus === 400 && /\bout of extra usage\b|\bextra usage\b[^.\n]*(?:unavailable|exhausted|disabled)/i.test(message)) {
-		status = "overage";
-		httpStatus = 402;
-	}
 	return {
 		type: "error",
 		message,
@@ -208,6 +199,12 @@ function resultError(message: any): BridgeEvent | null {
 	const errors = Array.isArray(message.errors) ? message.errors.filter(Boolean).join("; ") : "";
 	const text = errors || (typeof message.result === "string" && message.result) || message.subtype || "error_during_execution";
 	const status = message.subtype === "success" ? "error_during_execution" : message.subtype;
+	// Claude can reject an overage fallback as an ordinary result API 400 before
+	// it emits rate_limit_info. Preserve that billing meaning, but do not infer it
+	// from generic transport errors that happen to quote user-supplied wording.
+	if (message.api_error_status === 400 && /\bout of extra usage\b|\bextra usage\b[^.\n]*(?:unavailable|exhausted|disabled)/i.test(text)) {
+		return errorEvent(text, "overage", 402);
+	}
 	return errorEvent(text, status, message.api_error_status);
 }
 
