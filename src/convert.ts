@@ -188,13 +188,23 @@ export type Conversation = {
 // custom system prompt was observed to route the turn through Extra Usage
 // (SECURITY.md). System/developer messages therefore ride along as a preamble on
 // the live user turn rather than being dropped.
+function escapeSystemInstructionDelimiters(text: string): string {
+	return text
+		.replaceAll("</system-instructions>", "&lt;/system-instructions>")
+		.replaceAll("<system-instructions>", "&lt;system-instructions>");
+}
+
 function withSystemPreamble(conversation: Conversation, system: string | undefined): Conversation {
 	if (!system) return conversation;
-	const preamble = `<system-instructions>\n${system}\n</system-instructions>`;
+	const preamble = `<system-instructions>\n${escapeSystemInstructionDelimiters(system)}\n</system-instructions>`;
+	const promptText = escapeSystemInstructionDelimiters(conversation.promptText);
+	const promptBlocks = conversation.promptBlocks?.map((block) =>
+		block.type === "text" ? { ...block, text: escapeSystemInstructionDelimiters(block.text) } : block,
+	);
 	return {
 		history: conversation.history,
-		promptText: conversation.promptText ? `${preamble}\n\n${conversation.promptText}` : preamble,
-		promptBlocks: conversation.promptBlocks && [{ type: "text", text: preamble }, ...conversation.promptBlocks],
+		promptText: promptText ? `${preamble}\n\n${promptText}` : preamble,
+		promptBlocks: promptBlocks && [{ type: "text", text: preamble }, ...promptBlocks],
 	};
 }
 
