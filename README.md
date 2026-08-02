@@ -28,16 +28,24 @@ The installer:
 
 1. Installs a stable runtime under `~/.hermes/claude-bridge/`.
 2. Installs the Claude Agent SDK and its platform-specific Claude Code executable there (about 200 MB).
-3. Installs the Hermes provider plugin.
-4. Adds the local provider to `~/.hermes/config.yaml`.
-5. Generates a random `CLAUDE_BRIDGE_API_KEY` in `~/.hermes/.env` and gives the same token to the service.
-6. Registers a launchd or systemd user service unless `--no-service` is passed.
+3. Installs the Hermes provider plugin, which registers the `claude-bridge` provider directly
+   (hermes-agent ≥ 2026-05 shows plugin providers in every picker — no `config.yaml` entry
+   needed; the obsolete entry older installs wrote is cleaned up to avoid a duplicate row).
+4. Generates a random `CLAUDE_BRIDGE_API_KEY` in `~/.hermes/.env` and gives the same token to the service.
+5. Registers a launchd or systemd user service unless `--no-service` is passed.
 
 Then choose **Claude Bridge** with `hermes model`, or from a running session:
 
 ```text
 /model claude-opus-5 --provider claude-bridge
 ```
+
+> Stock hermes-agent has a gap: `/model … --provider claude-bridge` and `hermes doctor`
+> resolve providers without consulting the plugin registry, so they reject plugin-only
+> providers that every picker happily shows. Until that lands upstream, apply
+> [`docs/patches/hermes-plugin-provider-resolution.patch`](./docs/patches/hermes-plugin-provider-resolution.patch)
+> to the hermes-agent checkout (keep it as an uncommitted working-tree change —
+> `hermes update` auto-stashes and restores it).
 
 Uninstall everything created by the installer with:
 

@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## Unreleased
 
+- Stopped writing the `providers.claude-bridge` entry to `config.yaml` (and clean up the
+  obsolete one on install): hermes-agent ≥ 2026-05 surfaces the provider plugin natively in
+  every picker, so the entry only produced a duplicate "Claude Bridge" row and mislabeled
+  sessions as `billing_provider: custom`. Port-change detection now reads the previously
+  installed plugin file instead. Stock hermes-agent still rejects plugin-only providers in
+  `/model … --provider` and `hermes doctor` (resolution never consults the plugin registry);
+  `docs/patches/hermes-plugin-provider-resolution.patch` fixes that until it lands upstream.
+
 - Hardened the installer ([#10](https://github.com/ricotrevisan/hermes-claude-bridge/issues/10)):
   a normal install after `install --link` now replaces the plugin symlinks instead of writing
   the port-substituted files through them into the source checkout (temp file + atomic rename);

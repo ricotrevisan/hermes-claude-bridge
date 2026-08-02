@@ -1,0 +1,32 @@
+diff --git a/hermes_cli/providers.py b/hermes_cli/providers.py
+index 241b51d70..3658eb119 100644
+--- a/hermes_cli/providers.py
++++ b/hermes_cli/providers.py
+@@ -944,4 +944,27 @@ def resolve_provider_full(
+     except Exception:
+         pass
+ 
++    # 4. Plugin-registered provider profiles (plugins/model-providers/<name>/).
++    # hermes_cli/models.py auto-injects these into the canonical picker list;
++    # resolve them here too so /model, --provider flags, and doctor accept
++    # the providers the pickers advertise.
++    try:
++        from providers import list_providers as _list_provider_profiles
++
++        for _pp in _list_provider_profiles():
++            _names = {_pp.name, *(getattr(_pp, "aliases", None) or ())}
++            if raw in _names or canonical in _names:
++                return ProviderDef(
++                    id=_pp.name,
++                    name=getattr(_pp, "display_name", "") or _pp.name,
++                    transport=getattr(_pp, "transport", "") or "openai_chat",
++                    api_key_env_vars=tuple(getattr(_pp, "env_vars", None) or ()),
++                    base_url=getattr(_pp, "base_url", "") or "",
++                    auth_type=getattr(_pp, "auth_type", "") or "api_key",
++                    doc=getattr(_pp, "description", "") or "",
++                    source="provider-plugin",
++                )
++    except Exception:
++        pass
++
+     return None

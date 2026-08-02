@@ -18,7 +18,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseDocument } from "yaml";
-import { ensureConfigProvider, healthCheck, writePlugin } from "../bin/install.mjs";
+import { healthCheck, installedPluginPort, writePlugin } from "../bin/install.mjs";
 import { removeConfigProvider, removePlugin } from "../bin/uninstall.mjs";
 
 const PKG_VERSION = JSON.parse(
@@ -72,25 +72,14 @@ test("normal install over a --link install replaces symlinks instead of writing 
 	assert.ok(lstatSync(join(dir, "plugin.yaml")).isSymbolicLink());
 });
 
-test("ensureConfigProvider reports the previous port and keeps user sibling keys", () => {
-	const home = tempDir("bridge-home-");
-	process.env.HERMES_HOME = home;
-	const cfg = join(home, "config.yaml");
+test("installedPluginPort reads the previously templated port for change detection", () => {
+	const root = tempDir("bridge-plugin-");
+	const src = fakePluginSrc(root);
+	const dir = join(root, "installed");
 
-	const first = ensureConfigProvider("8787");
-	assert.equal(first.existed, false);
-	assert.equal(first.previousPort, undefined);
-
-	const doc = parseDocument(readFileSync(cfg, "utf8"));
-	doc.setIn(["providers", "claude-bridge", "timeout"], 99);
-	writeFileSync(cfg, doc.toString());
-
-	const second = ensureConfigProvider("9999");
-	assert.equal(second.existed, true);
-	assert.equal(second.previousPort, "8787");
-	const after: any = parseDocument(readFileSync(cfg, "utf8")).toJSON();
-	assert.equal(after.providers["claude-bridge"].timeout, 99);
-	assert.equal(after.providers["claude-bridge"].base_url, "http://127.0.0.1:9999/v1");
+	assert.equal(installedPluginPort(dir), undefined);
+	writePlugin(dir, "9191", false, src);
+	assert.equal(installedPluginPort(dir), "9191");
 });
 
 const OWNED_ENTRY = `    name: Claude Bridge (Claude Code subscription)
@@ -119,7 +108,11 @@ test("uninstall drops the provider entry entirely when only installed keys remai
 	const home = tempDir("bridge-home-");
 	process.env.HERMES_HOME = home;
 	const cfg = join(home, "config.yaml");
-	writeFileSync(cfg, `providers:\n  claude-bridge:\n${OWNED_ENTRY}\n  other:\n    base_url: http://example.test\n`);
+	// default_model is Hermes bookkeeping on our entry — treated as owned.
+	writeFileSync(
+		cfg,
+		`providers:\n  claude-bridge:\n${OWNED_ENTRY}\n    default_model: claude-fable-5\n  other:\n    base_url: http://example.test\n`,
+	);
 
 	removeConfigProvider();
 	const after: any = parseDocument(readFileSync(cfg, "utf8")).toJSON();

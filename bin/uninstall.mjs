@@ -9,7 +9,9 @@ import { isMap, parseDocument } from "yaml";
 const LABEL = "com.ricotrevisan.hermes-claude-bridge";
 const ENV_KEY = "CLAUDE_BRIDGE_API_KEY";
 // What install writes; anything else in the entry or plugin dir is the user's.
-const OWNED_PROVIDER_KEYS = ["name", "base_url", "key_env", "transport", "api_mode"];
+// default_model is Hermes bookkeeping stamped onto our entry when it was
+// picked via the named-custom row — it exists only because our entry did.
+const OWNED_PROVIDER_KEYS = ["name", "base_url", "key_env", "transport", "api_mode", "default_model"];
 const OWNED_PLUGIN_FILES = ["__init__.py", "plugin.yaml"];
 
 function hermesHome() {

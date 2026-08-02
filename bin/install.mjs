@@ -26,7 +26,7 @@ import {
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { isMap, parseDocument } from "yaml";
+import { removeConfigProvider } from "./uninstall.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = join(__dirname, "..");
@@ -173,51 +173,16 @@ function ensureApiToken() {
 	return { envPath, token, generated: true };
 }
 
-// Add providers.claude-bridge to config.yaml (the system the `hermes model`
-// switch uses). Validates the file is a YAML map first, preserves comments and
-// any user-added sibling keys under the entry.
-export function ensureConfigProvider(port) {
-	const configPath = join(hermesHome(), "config.yaml");
-	let doc;
-	if (existsSync(configPath)) {
-		doc = parseDocument(readFileSync(configPath, "utf8"));
-		if (doc.errors && doc.errors.length) {
-			throw new Error(`~/.hermes/config.yaml has YAML errors — fix it and re-run: ${doc.errors[0].message}`);
-		}
-		if (doc.contents != null && !isMap(doc.contents)) {
-			throw new Error("~/.hermes/config.yaml is not a YAML mapping — cannot add a providers entry");
-		}
-	} else {
-		doc = parseDocument("{}");
+// The port a previous install templated into the plugin — the anchor for
+// port-change detection. Best-effort: a --link install carries the source
+// default instead of a templated value.
+export function installedPluginPort(pluginDir) {
+	try {
+		const init = readFileSync(join(pluginDir, "__init__.py"), "utf8");
+		return /os\.environ\.get\("CLAUDE_BRIDGE_PORT", "(\d+)"\)/.exec(init)?.[1];
+	} catch {
+		return undefined;
 	}
-
-	const existed = doc.hasIn(["providers", "claude-bridge"]);
-	let previousPort;
-	if (existed) {
-		const prevUrl = String(doc.getIn(["providers", "claude-bridge", "base_url"]) ?? "");
-		previousPort = /^http:\/\/(?:127\.0\.0\.1|localhost):(\d+)\//.exec(prevUrl)?.[1];
-	}
-	const owned = {
-		name: "Claude Bridge (Claude Code subscription)",
-		base_url: `http://127.0.0.1:${port}/v1`,
-		key_env: ENV_KEY,
-		transport: "openai_chat",
-		api_mode: "chat_completions",
-	};
-	// Preserve any user-added sibling keys on an existing entry.
-	let merged = owned;
-	if (existed) {
-		const cur = doc.getIn(["providers", "claude-bridge"]);
-		const curObj = cur && typeof cur.toJSON === "function" ? cur.toJSON() : {};
-		merged = { ...curObj, ...owned };
-	}
-	doc.setIn(["providers", "claude-bridge"], merged);
-	const providersNode = doc.getIn(["providers"], true);
-	if (providersNode && providersNode.flow) providersNode.flow = false;
-	const entryNode = doc.getIn(["providers", "claude-bridge"], true);
-	if (entryNode && entryNode.flow) entryNode.flow = false;
-	writeFileSync(configPath, doc.toString());
-	return { configPath, existed, previousPort };
 }
 
 function servicePath(node, stableServer, port, logFile, token) {
@@ -417,9 +382,9 @@ export async function install(argv) {
 	// Transparency: state what will change before mutating anything.
 	console.log(`hermes-claude-bridge install — this will:
   • copy the bridge server to ${stableRuntimeDir()}
-  • write a provider plugin to ${join(home, "plugins", "model-providers", "claude-bridge")}
+  • write a provider plugin to ${join(home, "plugins", "model-providers", "claude-bridge")} (registers the provider in Hermes directly)
   • add a random ${ENV_KEY} to ${join(home, ".env")} (the bridge requires it as a bearer token)
-  • add providers.claude-bridge to ${join(home, "config.yaml")}${service ? `\n  • register a background auto-start service (${platform() === "darwin" ? "launchd" : "systemd --user"})` : ""}
+  • remove the obsolete providers.claude-bridge entry from ${join(home, "config.yaml")} if an older install added one${service ? `\n  • register a background auto-start service (${platform() === "darwin" ? "launchd" : "systemd --user"})` : ""}
   • install the Agent SDK runtime and force OAuth subscription auth for every turn
   (reverse all of this any time with: hermes-claude-bridge uninstall)
 `);
@@ -429,14 +394,18 @@ export async function install(argv) {
 	console.log(`• Runtime → ${stableServer}`);
 
 	const pluginDir = join(home, "plugins", "model-providers", "claude-bridge");
+	const previousPort = installedPluginPort(pluginDir);
 	console.log(`• Plugin → ${pluginDir}${link ? " (symlinked)" : ""}`);
 	writePlugin(pluginDir, port, link);
 
 	const { envPath, token, generated } = ensureApiToken();
 	console.log(`• ${generated ? "Generated" : "Reused"} ${ENV_KEY} in ${envPath} (bearer token — keep it secret)`);
 
-	const { configPath, existed, previousPort } = ensureConfigProvider(port);
-	console.log(`• ${existed ? "Updated" : "Added"} providers.claude-bridge in ${configPath}`);
+	// 0.2.0 installs wrote a providers.claude-bridge entry; modern Hermes
+	// surfaces the plugin itself, so the entry only duplicates the picker row
+	// and mislabels sessions as billing_provider "custom".
+	removeConfigProvider();
+
 	const portChanged = previousPort !== undefined && previousPort !== String(port);
 	if (portChanged) console.log(`• Provider port changed: ${previousPort} → ${port}`);
 
