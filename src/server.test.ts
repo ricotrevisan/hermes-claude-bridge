@@ -92,6 +92,79 @@ test("streaming response preserves Hermes' required SSE frame order", async () =
 	});
 });
 
+test("a stream that ends without a usage event omits the usage frame instead of fabricating zeros", async () => {
+	await withServer([
+		{ type: "text", delta: "partial" },
+	], async (baseUrl) => {
+		const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+			method: "POST",
+			headers: authHeaders,
+			body: JSON.stringify({ ...JSON.parse(requestBody), stream: true }),
+		});
+		assert.equal(response.status, 200);
+		const frames = (await response.text()).trim().split("\n\n");
+		assert.equal(frames.at(-1), "data: [DONE]");
+		const payloads = frames.slice(0, -1).map((frame) => JSON.parse(frame.replace(/^data: /, "")));
+		assert.ok(payloads.every((payload) => !("usage" in payload)), "no fabricated zero-usage frame");
+		assert.equal(payloads.at(-1).choices[0].finish_reason, "stop");
+	});
+});
+
+test("HTTP edge rejects malformed messages and reasoning effort as 400 before starting Claude", async () => {
+	let runnerStarted = false;
+	await withServer([], async (baseUrl) => {
+		const malformed = [
+			{ name: "null message", payload: { messages: [null] } },
+			{ name: "non-object message", payload: { messages: ["hello"] } },
+			{ name: "missing role", payload: { messages: [{ content: "hi" }] } },
+			{ name: "numeric content", payload: { messages: [{ role: "user", content: 42 }] } },
+			{ name: "null content part", payload: { messages: [{ role: "user", content: [null] }] } },
+			{ name: "content part without a type", payload: { messages: [{ role: "user", content: [{ text: "hi" }] }] } },
+			{ name: "non-array tool_calls", payload: { messages: [{ role: "assistant", content: "hi", tool_calls: {} }] } },
+			{ name: "numeric reasoning_effort", payload: { messages: [{ role: "user", content: "hi" }], reasoning_effort: 3 } },
+		];
+		for (const { name, payload } of malformed) {
+			const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+				method: "POST",
+				headers: authHeaders,
+				body: JSON.stringify({ model: "fable", ...payload }),
+			});
+			assert.equal(response.status, 400, name);
+			assert.equal((await response.json() as any).error.type, "invalid_request_error", name);
+		}
+		assert.equal(runnerStarted, false);
+	}, () => {
+		runnerStarted = true;
+	});
+});
+
+test("HTTP edge accepts well-formed content parts and string reasoning effort", async () => {
+	let reasoning: unknown;
+	await withServer([
+		{ type: "usage", usage: { input_tokens: 2, output_tokens: 1 } },
+		{ type: "done", stopReason: "end_turn" },
+	], async (baseUrl) => {
+		const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+			method: "POST",
+			headers: authHeaders,
+			body: JSON.stringify({
+				model: "fable",
+				messages: [
+					{ role: "user", content: [
+						{ type: "text", text: "what is this?" },
+						{ type: "image_url", image_url: { url: "https://example.com/x.png" } },
+					] },
+				],
+				reasoning_effort: "high",
+			}),
+		});
+		assert.equal(response.status, 200);
+	}, (options) => {
+		reasoning = options.reasoning;
+	});
+	assert.equal(reasoning, "high");
+});
+
 test("HTTP edge requires the per-install bearer token on every quota-spending route", async () => {
 	let runnerStarted = false;
 	await withServer([], async (baseUrl) => {

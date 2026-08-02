@@ -165,6 +165,41 @@ test("served context selects the requested model rather than auxiliary model usa
 	assert.equal(servedContextWindow({}, "claude-fable-5[1m]"), undefined);
 });
 
+test("served context matches the exact runtime id or its dated snapshots, never a bare prefix", () => {
+	// A new model (claude-opus-5-1) must not inherit claude-opus-5's expectations.
+	assert.equal(servedContextWindow({ "claude-opus-5-1": { contextWindow: 1_000_000 } }, "claude-opus-5[1m]"), undefined);
+	assert.equal(servedContextWindow({ "claude-opus-5": { contextWindow: 1_000_000 } }, "claude-opus-5[1m]"), 1_000_000);
+	assert.equal(servedContextWindow({ "claude-opus-5-20260201": { contextWindow: 200_000 } }, "claude-opus-5[1m]"), 200_000);
+	assert.equal(servedContextWindow({ "claude-opus-5": {} }, "claude-opus-5[1m]"), undefined);
+});
+
+test("warns loudly when the served model keys are unknown to the catalog", async (t) => {
+	const warn = t.mock.method(console, "warn", () => {});
+	await collect([{ role: "user", content: "hi" }], {
+		model: "claude-opus-5[1m]",
+		queryFn: (() => fakeQuery([
+			init(),
+			result({ modelUsage: { "claude-opus-5-1": { contextWindow: 1_000_000 } } }),
+		])) as any,
+	});
+	const warnings = warn.mock.calls.map((call) => String(call.arguments[0]));
+	assert.ok(warnings.some((line) => /no modelUsage entry/.test(line) && /claude-opus-5-1/.test(line)),
+		`warnings: ${warnings.join(" | ")}`);
+});
+
+test("warns when the served entry reports no usable contextWindow", async (t) => {
+	const warn = t.mock.method(console, "warn", () => {});
+	await collect([{ role: "user", content: "hi" }], {
+		model: "claude-opus-5[1m]",
+		queryFn: (() => fakeQuery([
+			init(),
+			result({ modelUsage: { "claude-opus-5": {} } }),
+		])) as any,
+	});
+	const warnings = warn.mock.calls.map((call) => String(call.arguments[0]));
+	assert.ok(warnings.some((line) => /no usable contextWindow/.test(line)), `warnings: ${warnings.join(" | ")}`);
+});
+
 test("unknown-model errors are not misreported as a missing executable", () => {
 	const message = "API Error: 404 model not found";
 	assert.equal(describeError(message), message);
@@ -270,6 +305,22 @@ test("streams thinking and text, skips duplicate assistant fallback, and trusts 
 		{ type: "reasoning", delta: "hmm" },
 		{ type: "text", delta: "Hello" },
 		{ type: "usage", usage: { input_tokens: 7, output_tokens: 8, cache_read_input_tokens: 2 } },
+		{ type: "done", stopReason: "end_turn" },
+	]);
+});
+
+test("a zero in result usage does not clobber token counts observed in the stream", async () => {
+	const events = await collect([{ role: "user", content: "hi" }], {
+		model: "test",
+		queryFn: (() =>
+			fakeQuery([
+				init(),
+				{ type: "stream_event", event: { type: "message_start", message: { usage: { input_tokens: 500 } } } },
+				result({ usage: { input_tokens: 0, output_tokens: 8 } }),
+			])) as any,
+	});
+	assert.deepEqual(events, [
+		{ type: "usage", usage: { input_tokens: 500, output_tokens: 8 } },
 		{ type: "done", stopReason: "end_turn" },
 	]);
 });
@@ -403,6 +454,35 @@ test("normalizes result, assistant, and rejected rate-limit failures", async (t)
 			assert.equal((events[0] as any).status, item.status);
 			assert.match((events[0] as any).message, item.message);
 			if (item.httpStatus) assert.equal((events[0] as any).httpStatus, item.httpStatus);
+		});
+	}
+});
+
+test("overage wording in non-400 errors is not remapped to a non-retryable 402", async (t) => {
+	const cases = [
+		{
+			name: "quoted user text inside an API 529 result",
+			messages: [init(), result({ is_error: true, result: 'The request quoted "out of extra usage" from the user', api_error_status: 529 })],
+			status: "error_during_execution",
+			httpStatus: 529,
+		},
+		{
+			name: "assistant error text mentioning extra usage with no API status",
+			messages: [init(), { type: "assistant", error: "billing_error", message: { content: [{ type: "text", text: "extra usage unavailable for this workspace" }] } }],
+			status: "billing_error",
+			httpStatus: undefined,
+		},
+	];
+	for (const item of cases) {
+		await t.test(item.name, async () => {
+			const events = await collect([{ role: "user", content: "hi" }], {
+				model: "test",
+				queryFn: (() => fakeQuery(item.messages)) as any,
+			});
+			assert.equal(events.length, 1);
+			assert.equal(events[0].type, "error");
+			assert.equal((events[0] as any).status, item.status);
+			assert.equal((events[0] as any).httpStatus, item.httpStatus);
 		});
 	}
 });

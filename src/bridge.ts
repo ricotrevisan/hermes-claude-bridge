@@ -108,28 +108,69 @@ function usageFrom(value: any): AnthropicUsage {
 }
 
 function mergeUsage(acc: AnthropicUsage, value: any): AnthropicUsage {
-	return { ...acc, ...usageFrom(value) };
+	const merged = { ...acc };
+	for (const [key, count] of Object.entries(usageFrom(value))) {
+		const field = key as keyof AnthropicUsage;
+		// A zero report is not informative: cache-heavy turns legitimately end
+		// with result usage input_tokens: 0, which must not clobber the positive
+		// counts observed in the stream.
+		if (count > 0 || merged[field] === undefined) merged[field] = count;
+	}
+	return merged;
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// The SDK keys modelUsage by runtime model id, with dated snapshots
+// (claude-haiku-4-5-20251001) for some models. Match the requested model
+// exactly or as a dated snapshot; a bare prefix would let a new model
+// (claude-opus-5-1) silently inherit claude-opus-5's expectations.
+function matchServedEntry(
+	modelUsage: Record<string, unknown>,
+	requestedModel: string,
+): { key: string; usage: unknown } | null {
+	const baseModel = requestedModel.replace(/\[1m\]$/i, "");
+	if (baseModel in modelUsage) return { key: baseModel, usage: modelUsage[baseModel] };
+	const datedSnapshot = new RegExp(`^${escapeRegExp(baseModel)}-\\d{8}$`);
+	for (const key of Object.keys(modelUsage)) {
+		if (datedSnapshot.test(key)) return { key, usage: modelUsage[key] };
+	}
+	return null;
 }
 
 export function servedContextWindow(modelUsage: unknown, requestedModel: string): number | undefined {
 	if (!modelUsage || typeof modelUsage !== "object") return undefined;
-	const baseModel = requestedModel.replace(/\[1m\]$/i, "");
-	for (const [model, usage] of Object.entries(modelUsage as Record<string, unknown>)) {
-		if (model !== baseModel && !model.startsWith(`${baseModel}-`)) continue;
-		const context = (usage as { contextWindow?: unknown })?.contextWindow;
-		if (typeof context === "number" && context > 0) return context;
-	}
-	return undefined;
+	const match = matchServedEntry(modelUsage as Record<string, unknown>, requestedModel);
+	const context = (match?.usage as { contextWindow?: unknown } | undefined)?.contextWindow;
+	return typeof context === "number" && context > 0 ? context : undefined;
 }
 
+const CATALOG_STALE_HINT = "Update the measured model catalog before relying on Hermes compaction thresholds.";
+
 function warnOnContextMismatch(message: any, requestedModel: string): void {
-	const served = servedContextWindow(message?.modelUsage, requestedModel);
-	if (!served) return;
-	const expected = expectedContextWindow(requestedModel);
-	if (served !== expected) {
+	const modelUsage = message?.modelUsage;
+	if (!modelUsage || typeof modelUsage !== "object") return;
+	const match = matchServedEntry(modelUsage as Record<string, unknown>, requestedModel);
+	if (!match) {
 		console.warn(
-			`hermes-claude-bridge: ${requestedModel} served a ${served}-token context window; expected ${expected}. ` +
-				"Update the measured model catalog before relying on Hermes compaction thresholds.",
+			`hermes-claude-bridge: ${requestedModel} has no modelUsage entry; the turn reported unknown model keys: ` +
+				`${Object.keys(modelUsage).join(", ") || "none"}. ${CATALOG_STALE_HINT}`,
+		);
+		return;
+	}
+	const context = servedContextWindow(modelUsage, requestedModel);
+	if (context === undefined) {
+		console.warn(
+			`hermes-claude-bridge: ${match.key} reported no usable contextWindow; context drift is unverified. ${CATALOG_STALE_HINT}`,
+		);
+		return;
+	}
+	const expected = expectedContextWindow(requestedModel);
+	if (context !== expected) {
+		console.warn(
+			`hermes-claude-bridge: ${requestedModel} served a ${context}-token context window; expected ${expected}. ${CATALOG_STALE_HINT}`,
 		);
 	}
 }
@@ -146,7 +187,9 @@ function errorEvent(message: string, status?: string, httpStatus?: number | null
 	// Claude can reject an overage fallback as an ordinary API 400 before it
 	// emits rate_limit_info. Preserve the billing meaning so Hermes does not
 	// retry a request that cannot run against the available subscription quota.
-	if (/\bout of extra usage\b|\bextra usage\b[^.\n]*(?:unavailable|exhausted|disabled)/i.test(message)) {
+	// Gate on the API status: quoted user content mentioning extra usage must
+	// not be remapped to a non-retryable 402.
+	if (httpStatus === 400 && /\bout of extra usage\b|\bextra usage\b[^.\n]*(?:unavailable|exhausted|disabled)/i.test(message)) {
 		status = "overage";
 		httpStatus = 402;
 	}

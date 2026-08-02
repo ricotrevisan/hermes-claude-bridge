@@ -99,6 +99,31 @@ function errorHttpStatus(event: Extract<BridgeEvent, { type: "error" }>): number
 	return 502;
 }
 
+// Shape-check the request at the HTTP boundary so malformed payloads fail as
+// 400 instead of throwing inside conversion and surfacing as upstream errors.
+function validateMessages(messages: unknown[]): string | null {
+	for (const message of messages) {
+		if (!message || typeof message !== "object") return "each message must be an object";
+		const m = message as OpenAIMessage;
+		if (typeof m.role !== "string" || !m.role) return "each message must have a string `role`";
+		const content = m.content;
+		if (content !== undefined && content !== null && typeof content !== "string" && !Array.isArray(content)) {
+			return "message `content` must be a string, an array of content parts, or null";
+		}
+		if (Array.isArray(content)) {
+			for (const part of content) {
+				if (!part || typeof part !== "object" || typeof (part as { type?: unknown }).type !== "string") {
+					return "each content part must be an object with a string `type`";
+				}
+			}
+		}
+		if (m.tool_calls !== undefined && (!Array.isArray(m.tool_calls) || m.tool_calls.some((call) => !call || typeof call !== "object"))) {
+			return "`tool_calls` must be an array of objects";
+		}
+	}
+	return null;
+}
+
 async function handleChatCompletion(req: IncomingMessage, res: ServerResponse, runner: BridgeRunner): Promise<void> {
 	if (req.headers.origin) {
 		sendError(res, 403, "browser-origin requests are not allowed", "forbidden");
@@ -123,6 +148,11 @@ async function handleChatCompletion(req: IncomingMessage, res: ServerResponse, r
 		sendError(res, 400, "`messages` must be a non-empty array", "invalid_request_error");
 		return;
 	}
+	const validationError = validateMessages(messages);
+	if (validationError) {
+		sendError(res, 400, validationError, "invalid_request_error");
+		return;
+	}
 
 	if (parsed?.model !== undefined && typeof parsed.model !== "string") {
 		sendError(res, 400, "`model` must be a string", "invalid_request_error");
@@ -140,6 +170,10 @@ async function handleChatCompletion(req: IncomingMessage, res: ServerResponse, r
 	}
 	const stream = parsed?.stream === true;
 	const reasoning = parsed?.reasoning_effort ?? parsed?.reasoning?.effort;
+	if (reasoning !== undefined && typeof reasoning !== "string") {
+		sendError(res, 400, "`reasoning_effort` must be a string", "invalid_request_error");
+		return;
+	}
 
 	// Client disconnect → abort the underlying query.
 	const ac = new AbortController();
@@ -163,7 +197,7 @@ async function streamResponse(
 	const id = newId();
 	const created = nowSeconds();
 	let headersSent = false;
-	let usage: AnthropicUsage = {};
+	let usage: AnthropicUsage | null = null;
 	let stopReason: string | null = null;
 
 	const startStream = () => {
@@ -179,7 +213,9 @@ async function streamResponse(
 
 	const finish = (reason: OpenAIFinishReason) => {
 		res.write(sseFrame(finishChunk(id, created, model, reason)));
-		res.write(sseFrame(usageChunk(id, created, model, mapUsage(usage))));
+		// No usage frame without an observed usage event: emitting mapUsage({})
+		// would make Hermes record a fabricated 0-token turn.
+		if (usage) res.write(sseFrame(usageChunk(id, created, model, mapUsage(usage))));
 		res.write(SSE_DONE);
 		res.end();
 	};
