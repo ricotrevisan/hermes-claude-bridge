@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format is based on
 
 ## Unreleased
 
+- Clarified the provider wording: the picker row and install output no longer say "no API
+  key" right before Hermes' setup flow shows one — they now explain that the detected key is
+  the installer's auto-managed local bearer token (keep it), not an Anthropic API key.
 - Stopped writing the `providers.claude-bridge` entry to `config.yaml` (and clean up the
   obsolete one on install): hermes-agent ≥ 2026-05 surfaces the provider plugin natively in
   every picker, so the entry only produced a duplicate "Claude Bridge" row and mislabeled

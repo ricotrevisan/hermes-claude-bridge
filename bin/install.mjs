@@ -458,7 +458,9 @@ Next steps:
   2. Pick the provider AND a model:        hermes model  → 'claude-bridge' → e.g. claude-opus-5
      (or in a running session:  /model claude-opus-5 --provider claude-bridge)
      If a Hermes session is already open, restart it so it re-reads config.yaml.
-  3. Chat as usual — Agent SDK turns run on your Claude subscription (no API key).
+  3. Chat as usual — Agent SDK turns run on your Claude subscription (no Anthropic API key).
+     If Hermes setup shows an "API key" for Claude Bridge, that is the ${ENV_KEY}
+     the installer just generated — keep it as-is.
 
 Notes:
   • The bridge listens on 127.0.0.1:${port}, only locally, and only for callers that send the ${ENV_KEY} bearer token.

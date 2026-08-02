@@ -53,7 +53,7 @@ register_provider(
         name="claude-bridge",
         aliases=("claude-code", "cc-bridge"),
         display_name="Claude Bridge (Claude Code subscription)",
-        description="Claude via local Claude Code bridge — no API key",
+        description="Claude via local Claude Code bridge — subscription billing; the API key it shows is its own auto-managed local token (keep it)",
         api_mode="chat_completions",
         base_url=f"http://127.0.0.1:{_PORT}/v1",
         auth_type="api_key",

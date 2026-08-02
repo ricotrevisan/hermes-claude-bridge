@@ -1,5 +1,5 @@
 name: claude-bridge-profile
 kind: model-provider
 version: 1.0.0
-description: Claude via local Claude Code bridge (subscription auth, no API key)
+description: Claude via local Claude Code bridge (subscription billing; authenticates with the installer's auto-managed local bearer token, not an Anthropic API key)
 author: Rico Trevisan
