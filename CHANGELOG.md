@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format is based on
 
 ## Unreleased
 
+- Hardened the installer ([#10](https://github.com/ricotrevisan/hermes-claude-bridge/issues/10)):
+  a normal install after `install --link` now replaces the plugin symlinks instead of writing
+  the port-substituted files through them into the source checkout (temp file + atomic rename);
+  uninstall removes only the keys and files install created, so user-added
+  `providers.claude-bridge` keys and extra plugin-dir files survive; the post-install health
+  check verifies the `/healthz` `service`/`version` identity instead of accepting any 200, and
+  install fails loudly while the port is held by something that is not the bridge; a
+  `--no-service` reinstall on a new port warns when an old bridge is still serving the
+  previous one.
+
 - Fixed system content being silently dropped
   ([#5](https://github.com/ricotrevisan/hermes-claude-bridge/issues/5)): `system` and
   `developer` messages were extracted and then discarded, so "always answer in French" had

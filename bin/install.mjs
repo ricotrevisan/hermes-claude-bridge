@@ -18,6 +18,7 @@ import {
 	existsSync,
 	mkdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -32,6 +33,8 @@ const PKG_ROOT = join(__dirname, "..");
 const LABEL = "com.ricotrevisan.hermes-claude-bridge";
 const DEFAULT_PORT = "8787";
 const ENV_KEY = "CLAUDE_BRIDGE_API_KEY";
+// Identity the server reports on /healthz (src/server.ts) — keep in sync.
+const SERVICE_NAME = "hermes-claude-bridge";
 // The value 0.1.x installs wrote when the server still ignored the header.
 const LEGACY_PLACEHOLDER = "claude-code-subscription";
 const PACKAGE_JSON = JSON.parse(readFileSync(join(PKG_ROOT, "package.json"), "utf8"));
@@ -119,20 +122,30 @@ function installRuntime(distServer) {
 	return stableServer;
 }
 
-function writePlugin(pluginDir, port, link) {
+// A prior `install --link` leaves symlinks at these paths; writeFileSync would
+// follow them and corrupt the source checkout. rename(2) replaces the path
+// itself — symlink included — without following it, so temp file + rename is
+// symlink-safe and atomic: no window with a missing or half-written file.
+function writeFileReplacing(target, content) {
+	const tmp = `${target}.tmp`;
+	writeFileSync(tmp, content);
+	renameSync(tmp, target);
+}
+
+export function writePlugin(pluginDir, port, link, srcDir = join(PKG_ROOT, "plugin")) {
 	mkdirSync(pluginDir, { recursive: true });
 	if (link) {
 		for (const f of ["__init__.py", "plugin.yaml"]) {
 			const target = join(pluginDir, f);
-			if (existsSync(target)) rmSync(target);
-			symlinkSync(join(PKG_ROOT, "plugin", f), target);
+			rmSync(target, { force: true }); // also clears dangling symlinks existsSync misses
+			symlinkSync(join(srcDir, f), target);
 		}
 		return;
 	}
-	let init = readFileSync(join(PKG_ROOT, "plugin", "__init__.py"), "utf8");
+	let init = readFileSync(join(srcDir, "__init__.py"), "utf8");
 	init = init.replace('os.environ.get("CLAUDE_BRIDGE_PORT", "8787")', `os.environ.get("CLAUDE_BRIDGE_PORT", "${port}")`);
-	writeFileSync(join(pluginDir, "__init__.py"), init);
-	writeFileSync(join(pluginDir, "plugin.yaml"), readFileSync(join(PKG_ROOT, "plugin", "plugin.yaml"), "utf8"));
+	writeFileReplacing(join(pluginDir, "__init__.py"), init);
+	writeFileReplacing(join(pluginDir, "plugin.yaml"), readFileSync(join(srcDir, "plugin.yaml"), "utf8"));
 }
 
 // The bridge and Hermes share one secret: the server validates it as a bearer
@@ -163,7 +176,7 @@ function ensureApiToken() {
 // Add providers.claude-bridge to config.yaml (the system the `hermes model`
 // switch uses). Validates the file is a YAML map first, preserves comments and
 // any user-added sibling keys under the entry.
-function ensureConfigProvider(port) {
+export function ensureConfigProvider(port) {
 	const configPath = join(hermesHome(), "config.yaml");
 	let doc;
 	if (existsSync(configPath)) {
@@ -179,6 +192,11 @@ function ensureConfigProvider(port) {
 	}
 
 	const existed = doc.hasIn(["providers", "claude-bridge"]);
+	let previousPort;
+	if (existed) {
+		const prevUrl = String(doc.getIn(["providers", "claude-bridge", "base_url"]) ?? "");
+		previousPort = /^http:\/\/(?:127\.0\.0\.1|localhost):(\d+)\//.exec(prevUrl)?.[1];
+	}
 	const owned = {
 		name: "Claude Bridge (Claude Code subscription)",
 		base_url: `http://127.0.0.1:${port}/v1`,
@@ -199,7 +217,7 @@ function ensureConfigProvider(port) {
 	const entryNode = doc.getIn(["providers", "claude-bridge"], true);
 	if (entryNode && entryNode.flow) entryNode.flow = false;
 	writeFileSync(configPath, doc.toString());
-	return { configPath, existed };
+	return { configPath, existed, previousPort };
 }
 
 function servicePath(node, stableServer, port, logFile, token) {
@@ -279,9 +297,34 @@ function portIsFree(port) {
 
 async function waitForPortFree(port, attempts = 20) {
 	for (let i = 0; i < attempts; i++) {
-		if (await portIsFree(port)) return;
+		if (await portIsFree(port)) return true;
 		await new Promise((r) => setTimeout(r, 250));
 	}
+	return false;
+}
+
+async function fetchHealthz(port) {
+	try {
+		const res = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(1500) });
+		if (!res.ok) return null;
+		const body = await res.json();
+		return body && typeof body === "object" ? body : null;
+	} catch {
+		return null;
+	}
+}
+
+// The only process install may displace is its own service (bootout above).
+// Anything else still holding the port would leave the new service crash-
+// looping on EADDRINUSE while the squatter answers the health check.
+async function ensurePortFree(port) {
+	if (await waitForPortFree(port)) return;
+	const body = await fetchHealthz(port);
+	const who =
+		body?.service === SERVICE_NAME
+			? `another ${SERVICE_NAME} instance${body.version ? ` (v${body.version})` : ""} — perhaps started manually`
+			: "a process that does not identify as the bridge";
+	throw new Error(`port ${port} is still in use by ${who}. Stop it or pick a different --port, then re-run install.`);
 }
 
 async function installService(node, stableServer, port, logFile, token) {
@@ -299,7 +342,7 @@ async function installService(node, stableServer, port, logFile, token) {
 		} catch {
 			/* not loaded */
 		}
-		await waitForPortFree(port);
+		await ensurePortFree(port);
 		execFileSync("launchctl", ["bootstrap", domain, svc.file], { stdio: "inherit" });
 		try {
 			execFileSync("launchctl", ["kickstart", "-k", `${domain}/${LABEL}`], { stdio: "ignore" });
@@ -330,18 +373,21 @@ async function installService(node, stableServer, port, logFile, token) {
 	}
 }
 
-async function healthCheck(port, attempts = 40) {
-	const url = `http://127.0.0.1:${port}/healthz`;
+// A 200 alone is not proof: a foreign process or a stale bridge could hold
+// the port. Require the service name and the exact version just installed.
+export async function healthCheck(port, attempts = 40) {
+	let saw = null;
 	for (let i = 0; i < attempts; i++) {
-		try {
-			const res = await fetch(url);
-			if (res.ok) return true;
-		} catch {
-			/* not up yet */
+		const body = await fetchHealthz(port);
+		if (body) {
+			if (body.service === SERVICE_NAME && body.version === PACKAGE_JSON.version) {
+				return { ok: true, saw: body };
+			}
+			saw = body;
 		}
 		await new Promise((r) => setTimeout(r, 500));
 	}
-	return false;
+	return { ok: false, saw };
 }
 
 // Confirms the running service got the same token Hermes will send.
@@ -389,8 +435,10 @@ export async function install(argv) {
 	const { envPath, token, generated } = ensureApiToken();
 	console.log(`• ${generated ? "Generated" : "Reused"} ${ENV_KEY} in ${envPath} (bearer token — keep it secret)`);
 
-	const { configPath, existed } = ensureConfigProvider(port);
+	const { configPath, existed, previousPort } = ensureConfigProvider(port);
 	console.log(`• ${existed ? "Updated" : "Added"} providers.claude-bridge in ${configPath}`);
+	const portChanged = previousPort !== undefined && previousPort !== String(port);
+	if (portChanged) console.log(`• Provider port changed: ${previousPort} → ${port}`);
 
 	const logsDir = join(home, "logs");
 	mkdirSync(logsDir, { recursive: true });
@@ -402,13 +450,31 @@ export async function install(argv) {
 		console.log(`• Service: ${svcFile}`);
 		console.log(`• Logs: ${logFile}`);
 		if (activated) {
-			const ok = await healthCheck(port);
-			console.log(ok ? `• Bridge is up on http://127.0.0.1:${port}` : "• ⚠️  Bridge did not answer /healthz yet — check the log.");
-			if (ok && !(await authCheck(port, token))) {
-				console.log(`• ⚠️  The running bridge rejected the ${ENV_KEY} in ${envPath} — an older instance may still hold the port.`);
+			const { ok, saw } = await healthCheck(port);
+			if (ok) {
+				console.log(`• Bridge v${PACKAGE_JSON.version} is up on http://127.0.0.1:${port}`);
+				if (!(await authCheck(port, token))) {
+					console.log(`• ⚠️  The running bridge rejected the ${ENV_KEY} in ${envPath} — an older instance may still hold the port.`);
+				}
+			} else if (saw?.service === SERVICE_NAME) {
+				throw new Error(
+					`port ${port} still answers as ${SERVICE_NAME} ${saw.version ? `v${saw.version}` : "(no version reported)"} — not the v${PACKAGE_JSON.version} just installed. A stale instance is holding the port; stop it and re-run install.`,
+				);
+			} else if (saw) {
+				throw new Error(
+					`port ${port} is serving something that is not hermes-claude-bridge — the service cannot bind. Pick a different --port and re-run install.`,
+				);
+			} else {
+				console.log("• ⚠️  Bridge did not answer /healthz yet — check the log.");
 			}
 		}
 	} else {
+		if (portChanged && (await fetchHealthz(previousPort))?.service === SERVICE_NAME) {
+			console.log(
+				`• ⚠️  A bridge is still running on the old port ${previousPort}, but config.yaml now points at ${port}.\n` +
+					`    Stop it (or restart it on port ${port}) — anything still using it runs the old install.`,
+			);
+		}
 		console.log(
 			"• Skipped service (--no-service). Run it with the token in the environment:\n" +
 				`      export $(grep -m1 '^${ENV_KEY}=' ${envPath}) && hermes-claude-bridge start`,

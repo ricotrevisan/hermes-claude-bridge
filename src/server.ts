@@ -34,6 +34,10 @@ import {
 import type { OpenAIMessage } from "./convert.js";
 import { expectedContextWindow, MODEL_IDS, resolveModel, runtimeModelId } from "./models.js";
 
+// Injected by esbuild at build time; absent when running from source.
+declare const __BRIDGE_VERSION__: string;
+const BRIDGE_VERSION = typeof __BRIDGE_VERSION__ === "string" ? __BRIDGE_VERSION__ : "dev";
+
 const DEFAULT_PORT = 8787;
 const HEADERS_TIMEOUT_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 120_000;
@@ -327,9 +331,10 @@ function handler(req: IncomingMessage, res: ServerResponse, runner: BridgeRunner
 	const url = (req.url ?? "").split("?")[0];
 	const method = req.method ?? "GET";
 
-	// Liveness only; it exposes no user content and spends no quota.
+	// Liveness only; it exposes no user content and spends no quota. The
+	// installer's health check matches service + version to spot squatters.
 	if (method === "GET" && (url === "/healthz" || url === "/health")) {
-		sendJson(res, 200, { status: "ok", service: "hermes-claude-bridge" });
+		sendJson(res, 200, { status: "ok", service: "hermes-claude-bridge", version: BRIDGE_VERSION });
 		return;
 	}
 	if (!hasBearerToken(req, token)) {

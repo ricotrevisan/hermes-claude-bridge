@@ -1,30 +1,61 @@
 // Uninstaller for hermes-claude-bridge: stop + remove the service and the plugin dir.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
-import { parseDocument } from "yaml";
+import { isMap, parseDocument } from "yaml";
 
 const LABEL = "com.ricotrevisan.hermes-claude-bridge";
 const ENV_KEY = "CLAUDE_BRIDGE_API_KEY";
+// What install writes; anything else in the entry or plugin dir is the user's.
+const OWNED_PROVIDER_KEYS = ["name", "base_url", "key_env", "transport", "api_mode"];
+const OWNED_PLUGIN_FILES = ["__init__.py", "plugin.yaml"];
 
 function hermesHome() {
 	return process.env.HERMES_HOME || join(homedir(), ".hermes");
 }
 
-function removeConfigProvider() {
+export function removeConfigProvider() {
 	const configPath = join(hermesHome(), "config.yaml");
 	if (!existsSync(configPath)) return;
 	try {
 		const doc = parseDocument(readFileSync(configPath, "utf8"));
-		if (doc.hasIn(["providers", "claude-bridge"])) {
-			doc.deleteIn(["providers", "claude-bridge"]);
-			writeFileSync(configPath, doc.toString());
-			console.log(`• Removed providers.claude-bridge from ${configPath}`);
-		}
+		const entry = doc.getIn(["providers", "claude-bridge"], true);
+		if (entry === undefined) return;
+		// Install merges around user-added sibling keys — uninstall must too. A
+		// non-map entry is a user replacement holding nothing install wrote.
+		if (!isMap(entry)) return;
+		for (const key of OWNED_PROVIDER_KEYS) doc.deleteIn(["providers", "claude-bridge", key]);
+		const removedAll = entry.items.length === 0;
+		if (removedAll) doc.deleteIn(["providers", "claude-bridge"]);
+		writeFileSync(configPath, doc.toString());
+		console.log(
+			removedAll
+				? `• Removed providers.claude-bridge from ${configPath}`
+				: `• Removed the installed keys from providers.claude-bridge in ${configPath} (kept your custom keys)`,
+		);
 	} catch {
 		/* leave config untouched on parse error */
+	}
+}
+
+export function removePlugin() {
+	const pluginDir = join(hermesHome(), "plugins", "model-providers", "claude-bridge");
+	if (!existsSync(pluginDir)) {
+		console.log(`• Plugin dir not found (already removed): ${pluginDir}`);
+		return;
+	}
+	for (const f of OWNED_PLUGIN_FILES) {
+		rmSync(join(pluginDir, f), { force: true });
+		rmSync(join(pluginDir, `${f}.tmp`), { force: true }); // stranded atomic-write temp
+	}
+	rmSync(join(pluginDir, "__pycache__"), { recursive: true, force: true });
+	try {
+		rmdirSync(pluginDir);
+		console.log(`• Removed plugin ${pluginDir}`);
+	} catch {
+		console.log(`• Removed plugin files from ${pluginDir} (kept files install did not create)`);
 	}
 }
 
@@ -86,15 +117,7 @@ export async function uninstall() {
 	console.log("• Stopping and removing the auto-start service…");
 	removeService();
 	removeRuntime();
-
-	const pluginDir = join(hermesHome(), "plugins", "model-providers", "claude-bridge");
-	if (existsSync(pluginDir)) {
-		rmSync(pluginDir, { recursive: true, force: true });
-		console.log(`• Removed plugin ${pluginDir}`);
-	} else {
-		console.log(`• Plugin dir not found (already removed): ${pluginDir}`);
-	}
-
+	removePlugin();
 	removeEnvKey();
 	removeConfigProvider();
 

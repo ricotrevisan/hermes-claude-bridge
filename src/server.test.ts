@@ -45,6 +45,7 @@ test("HTTP edge serves context metadata and sends the measured runtime model", a
 		assert.deepEqual(await (await fetch(`${baseUrl}/healthz`)).json(), {
 			status: "ok",
 			service: "hermes-claude-bridge",
+			version: "dev", // esbuild injects the real version at build time
 		});
 		const models: any = await (await fetch(`${baseUrl}/v1/models`, { headers: authHeaders })).json();
 		assert.equal(models.data.length, 8);
