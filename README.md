@@ -108,15 +108,17 @@ The child environment removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTH
 
 The bridge uses the Agent SDK's official Claude Code system-prompt preset and never forwards inbound system content as the SDK's system prompt. This boundary is load-bearing for subscription routing: a raw custom system prompt, or appending the full Hermes harness prompt, was observed to route the request through Extra Usage instead. `system` and `developer` messages are instead delivered inside the live user turn, wrapped in a `<system-instructions>` block, so instructions like "always answer in French" still take effect.
 
-### Default and full-agent modes
+### Default, tool, and full-agent modes
 
-**Default:** Claude behaves as a clean conversational model. Claude Code tools are disabled. Hermes tool bridging is not implemented yet.
+**Default:** Claude behaves as a clean conversational model. Claude Code tools are disabled.
 
-**Full agent:** set `CLAUDE_BRIDGE_FULL_AGENT=1` before starting the bridge. Claude Code gets its own built-in tools with bypass permissions. This is powerful and can read, write, or execute commands starting from `CLAUDE_BRIDGE_CWD` (default `~/.hermes/claude-bridge-workspace`); it still does not execute Hermes tools.
+**Tool mode (Hermes tool bridging):** when Hermes sends `tools` in its request, the bridge exposes those exact schemas to Claude Code through an in-process MCP server. When Claude calls one, the bridge streams an OpenAI `tool_call` back to Hermes with `finish_reason: "tool_calls"`; Hermes executes the tool with its own permissions and sends the result in the next request; the bridge resolves the blocked MCP handler and Claude continues the same turn. Claude Code's built-in tools are all disallowed, so the only tool path is through Hermes — the bridge never executes a tool itself.
+
+**Full agent:** `CLAUDE_BRIDGE_FULL_AGENT=1` was removed in 0.3.0 — tool mode replaces it. (Older installs may still set it; the variable is ignored.)
 
 ### Roadmap
 
-Hermes tool passthrough is deliberately outside the `0.2.0` scope. The proposed stateful MCP adapter is specified in [GitHub issue #1](https://github.com/ricotrevisan/hermes-claude-bridge/issues/1). Until that work is implemented and hardened, default mode remains tool-free and full-agent mode uses only Claude Code's tools.
+Hermes tool passthrough (tool mode above) shipped in 0.3.0, replacing the old full-agent mode. Remaining work is tracked in [GitHub issues](https://github.com/ricotrevisan/hermes-claude-bridge/issues).
 
 ## Configuration
 
@@ -124,9 +126,8 @@ Hermes tool passthrough is deliberately outside the `0.2.0` scope. The proposed 
 | --- | --- | --- |
 | `CLAUDE_BRIDGE_PORT` | `8787` | Local HTTP port. |
 | `CLAUDE_BRIDGE_API_KEY` | none (required) | Bearer token every request except `/healthz` must present. The installer generates it. |
-| `CLAUDE_BRIDGE_CWD` | process working directory, or `~/.hermes/claude-bridge-workspace` in full-agent mode | Claude Code working directory. |
+| `CLAUDE_BRIDGE_CWD` | process working directory, or `~/.hermes/claude-bridge-workspace` (legacy full-agent only) | Claude Code working directory. |
 | `CLAUDE_BRIDGE_CLAUDE_BIN` | SDK bundled executable | Override the Claude Code executable used by the SDK. |
-| `CLAUDE_BRIDGE_FULL_AGENT` | unset | Set to `1` for Claude Code's built-in agent tools. |
 | `CLAUDE_CONFIG_DIR` | Claude Code default | Alternate Claude Code credentials/session directory. On macOS, setting this requires `~/.claude/.credentials.json` to exist in that directory; a Keychain-only login there cannot be replayed into the SDK's temporary session directory. |
 
 ## Development

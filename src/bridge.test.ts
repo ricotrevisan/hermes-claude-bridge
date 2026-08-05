@@ -226,7 +226,7 @@ test("clean mode keeps the Claude Code preset but still delivers system instruct
 	assert.match(prompt.message.content, /always answer in French/);
 });
 
-test("full-agent mode uses Claude Code tools but still suppresses settings and MCP", async () => {
+test("the removed full-agent env var is ignored; clean mode still suppresses settings and MCP", async () => {
 	const previous = process.env.CLAUDE_BRIDGE_FULL_AGENT;
 	process.env.CLAUDE_BRIDGE_FULL_AGENT = "1";
 	let params: any;
@@ -245,11 +245,13 @@ test("full-agent mode uses Claude Code tools but still suppresses settings and M
 				}) as any,
 			},
 		);
-		assert.deepEqual(params.options.tools, { type: "preset", preset: "claude_code" });
+		// Full-agent mode was removed in 0.3.0: the env var must NOT flip the
+		// query into bypassPermissions with Claude Code's built-in tools. Clean
+		// mode's isolated one-turn configuration applies instead.
+		assert.deepEqual(params.options.tools, []);
 		assert.deepEqual(params.options.systemPrompt, { type: "preset", preset: "claude_code" });
-		assert.equal(params.options.permissionMode, "bypassPermissions");
-		assert.equal(params.options.allowDangerouslySkipPermissions, true);
-		assert.equal(params.options.maxTurns, undefined);
+		assert.equal(params.options.permissionMode, undefined);
+		assert.equal(params.options.maxTurns, 1);
 		assert.equal(params.options.persistSession, false);
 		assert.deepEqual(params.options.mcpServers, {});
 		assert.equal(params.options.strictMcpConfig, true);
@@ -259,32 +261,6 @@ test("full-agent mode uses Claude Code tools but still suppresses settings and M
 	} finally {
 		if (previous === undefined) delete process.env.CLAUDE_BRIDGE_FULL_AGENT;
 		else process.env.CLAUDE_BRIDGE_FULL_AGENT = previous;
-	}
-});
-
-test("full-agent mode works in a dedicated workspace instead of the home directory", async () => {
-	const previous = { full: process.env.CLAUDE_BRIDGE_FULL_AGENT, home: process.env.HERMES_HOME };
-	const hermesHome = await mkdtemp(join(tmpdir(), "bridge-home-"));
-	process.env.CLAUDE_BRIDGE_FULL_AGENT = "1";
-	process.env.HERMES_HOME = hermesHome;
-	let params: any;
-	try {
-		await collect([{ role: "user", content: "hi" }], {
-			model: "test",
-			queryFn: ((value: any) => {
-				params = value;
-				return fakeQuery([init(), result()]);
-			}) as any,
-		});
-		const workspace = join(hermesHome, "claude-bridge-workspace");
-		assert.equal(params.options.cwd, workspace);
-		assert.deepEqual(await readdir(workspace), []);
-	} finally {
-		if (previous.full === undefined) delete process.env.CLAUDE_BRIDGE_FULL_AGENT;
-		else process.env.CLAUDE_BRIDGE_FULL_AGENT = previous.full;
-		if (previous.home === undefined) delete process.env.HERMES_HOME;
-		else process.env.HERMES_HOME = previous.home;
-		await rm(hermesHome, { recursive: true, force: true });
 	}
 });
 
@@ -680,3 +656,79 @@ test("history is replayed through an in-memory session store, never the user's c
 	}
 });
 
+
+test("tool mode passes Hermes tools as an MCP server and blocks built-in tools", async () => {
+	let params: any;
+	const events = await collect(
+		[
+			{ role: "user", content: "hi" },
+		],
+		{
+			model: "test",
+			cwd: "/tmp",
+			tools: [
+				{ type: "function", function: { name: "web_search", description: "Search", parameters: { type: "object", properties: { q: { type: "string" } } } } },
+			],
+			queryFn: ((value: any) => {
+				params = value;
+				return fakeQuery([init(), result()]);
+			}) as any,
+		},
+	);
+	assert.equal(events.some((e) => e.type === "done"), true);
+	assert.deepEqual(params.options.tools, []);
+	assert.equal(params.options.permissionMode, "bypassPermissions");
+	assert.equal(params.options.allowDangerouslySkipPermissions, true);
+	assert.deepEqual(params.options.allowedTools, ["mcp__hermes-tools__*"]);
+	assert.ok(params.options.disallowedTools.includes("Bash"));
+	assert.ok(params.options.disallowedTools.includes("Read"));
+	assert.ok(params.options.disallowedTools.includes("AskUserQuestion"));
+	assert.equal(params.options.maxTurns, undefined);
+	assert.deepEqual(params.options.systemPrompt, { type: "preset", preset: "claude_code" });
+	assert.equal("hermes-tools" in params.options.mcpServers, true);
+});
+
+test("tool mode yields tool_call events for tool_use blocks and keeps the query alive", async () => {
+	let params: any;
+	const toolBridge = { createToolBridgeState: undefined } as any;
+	const { createToolBridgeState: createState } = await import("./toolbridge.js");
+	const state = createState();
+
+	const events = await collect(
+		[{ role: "user", content: "hi" }],
+		{
+			model: "test",
+			cwd: "/tmp",
+			tools: [
+				{ type: "function", function: { name: "echo", description: "echo", parameters: { type: "object", properties: {} } } },
+			],
+			toolBridge: state,
+			queryFn: ((value: any) => {
+				params = value;
+				return fakeQuery([
+					init(),
+					{
+						type: "assistant",
+						message: {
+							content: [
+								{ type: "text", text: "Let me check." },
+								{ type: "tool_use", id: "toolu_1", name: "mcp__hermes-tools__echo", input: {} },
+							],
+						},
+						parent_tool_use_id: null,
+					} as any,
+					result(),
+				]);
+			}) as any,
+		},
+	);
+
+	const toolCall = events.find((e) => e.type === "tool_call");
+	assert.ok(toolCall);
+	if (toolCall?.type === "tool_call") {
+		assert.deepEqual(toolCall.calls, [{ id: "toolu_1", name: "echo", arguments: "{}" }]);
+	}
+	assert.deepEqual(state.turnToolCallIds, ["toolu_1"]);
+	// Text accompanying the tool call is still surfaced.
+	assert.ok(events.some((e) => e.type === "text" && e.delta === "Let me check."));
+});

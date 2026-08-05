@@ -15,14 +15,32 @@ import {
 	type SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createSession, repairToolPairing, type Message } from "cc-session-io";
-import { mkdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { splitConversation, type OpenAIMessage } from "./convert.js";
 import { expectedContextWindow } from "./models.js";
 import type { AnthropicUsage } from "./openai.js";
+import {
+	createMcpServer,
+	createToolBridgeState,
+	deliverToolResult,
+	recordToolUses,
+	MCP_SERVER_NAME,
+	type HermesToolDef,
+	type ToolBridgeState,
+	type ToolCallInvocation,
+} from "./toolbridge.js";
 
-const DISALLOWED_TOOLS = ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"];
+// Claude Code's built-in tools, blocked in tool mode so the only tools Claude
+// can call are the ones routed to Hermes' own permission system. Ported from
+// pi-claude-bridge's DISALLOWED_BUILTIN_TOOLS.
+const DISALLOWED_BUILTIN_TOOLS = [
+	"Read", "Write", "Edit", "Glob", "Grep", "Bash", "Agent",
+	"NotebookEdit", "EnterWorktree", "ExitWorktree",
+	"CronCreate", "CronDelete", "CronList", "TeamCreate", "TeamDelete",
+	"WebFetch", "WebSearch", "TodoRead", "TodoWrite",
+	"EnterPlanMode", "ExitPlanMode", "RemoteTrigger", "SendMessage",
+	"Skill", "TaskOutput", "TaskStop", "ToolSearch",
+	"AskUserQuestion", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate",
+];
 
 const REASONING_TO_EFFORT: Record<string, EffortLevel> = {
 	minimal: "low",
@@ -39,13 +57,18 @@ export type BridgeEvent =
 	| { type: "reasoning"; delta: string }
 	| { type: "usage"; usage: AnthropicUsage }
 	| { type: "done"; stopReason: string | null }
-	| { type: "error"; message: string; status?: string; httpStatus?: number };
+	| { type: "error"; message: string; status?: string; httpStatus?: number }
+	| { type: "tool_call"; calls: ToolCallInvocation[] };
 
 export type RunOptions = {
 	model: string;
 	reasoning?: string;
 	cwd?: string;
 	signal?: AbortSignal;
+	/** Hermes tool definitions to expose to Claude via MCP. Enables tool mode. */
+	tools?: HermesToolDef[];
+	/** Per-query bridge state; the HTTP coordinator resolves tool results through it. */
+	toolBridge?: ToolBridgeState;
 	/** Test/offline seam. Production callers use the SDK's query(). */
 	queryFn?: typeof sdkQuery;
 };
@@ -208,17 +231,8 @@ function resultError(message: any): BridgeEvent | null {
 	return errorEvent(text, status, message.api_error_status);
 }
 
-function fullAgentMode(): boolean {
-	return process.env.CLAUDE_BRIDGE_FULL_AGENT === "1";
-}
-
-// Full-agent turns run tools under bypassPermissions, so they get a dedicated
-// directory instead of inheriting $HOME from the installed service. It sits
-// beside the runtime dir, not inside it, so uninstall cannot delete its files.
-function ensureFullAgentWorkspace(): string {
-	const dir = join(process.env.HERMES_HOME || join(homedir(), ".hermes"), "claude-bridge-workspace");
-	mkdirSync(dir, { recursive: true });
-	return dir;
+function toolMode(tools: HermesToolDef[] | undefined): boolean {
+	return Array.isArray(tools) && tools.length > 0;
 }
 
 type Replay = { sessionId: string; store: SessionStore };
@@ -250,8 +264,9 @@ function queryOptions(
 	cwd: string,
 	replay: Replay | null,
 	opts: RunOptions,
+	toolBridge: ToolBridgeState,
 ): ClaudeQueryOptions {
-	const fullAgent = fullAgentMode();
+	const tools = toolMode(opts.tools);
 	const effort = opts.reasoning ? REASONING_TO_EFFORT[opts.reasoning.toLowerCase()] : undefined;
 	const executable = process.env.CLAUDE_BRIDGE_CLAUDE_BIN;
 
@@ -271,13 +286,21 @@ function queryOptions(
 		...(executable ? { pathToClaudeCodeExecutable: executable } : {}),
 	};
 
-	if (fullAgent) {
+	if (tools) {
+		// Tool mode: Claude Code runs toolless except for the MCP server that
+		// exposes Hermes' tools. Every tool call routes through a blocking MCP
+		// handler to Hermes' own permission system; Claude never executes.
+		const mcpServer = createMcpServer(opts.tools ?? [], toolBridge);
 		return {
 			...common,
-			tools: { type: "preset", preset: "claude_code" },
+			mcpServers: { [MCP_SERVER_NAME]: mcpServer },
+			tools: [],
 			permissionMode: "bypassPermissions",
 			allowDangerouslySkipPermissions: true,
-			disallowedTools: DISALLOWED_TOOLS,
+			allowedTools: [`mcp__${MCP_SERVER_NAME}__*`],
+			disallowedTools: DISALLOWED_BUILTIN_TOOLS,
+			// The official preset without the outer Hermes harness prompt is
+			// load-bearing for Claude subscription routing (same as clean mode).
 			systemPrompt: { type: "preset", preset: "claude_code" },
 		};
 	}
@@ -314,8 +337,12 @@ export async function* runClaude(
 	messages: OpenAIMessage[],
 	opts: RunOptions,
 ): AsyncGenerator<BridgeEvent> {
-	const cwd = opts.cwd || process.env.CLAUDE_BRIDGE_CWD || (fullAgentMode() ? ensureFullAgentWorkspace() : process.cwd());
+	const cwd = opts.cwd || process.env.CLAUDE_BRIDGE_CWD || process.cwd();
 	const { history, promptText, promptBlocks } = splitConversation(messages);
+	// Tool mode shares this state with the MCP server AND with the HTTP
+	// coordinator (when the caller supplies one): recorded tool_use ids must
+	// land in the same state the blocked MCP handlers read from.
+	const toolBridge = opts.toolBridge ?? createToolBridgeState();
 	let activeQuery: Query | null = null;
 	let aborted = opts.signal?.aborted ?? false;
 	let releasePrompt: (send: boolean) => void = () => {};
@@ -354,7 +381,7 @@ export async function* runClaude(
 		const content = promptBlocks ?? promptText;
 		activeQuery = (opts.queryFn ?? sdkQuery)({
 			prompt: gatedPrompt(content, promptGate),
-			options: queryOptions(cwd, replay, opts),
+			options: queryOptions(cwd, replay, opts, toolBridge),
 		});
 
 		if (opts.signal?.aborted) onAbort();
@@ -430,6 +457,29 @@ export async function* runClaude(
 					failed = true;
 					yield errorEvent(assistantText(message) || message.error, message.error);
 					break;
+				}
+				if (toolMode(opts.tools)) {
+					const toolUses = (message.message?.content ?? []).filter((block) => block?.type === "tool_use");
+					if (toolUses.length > 0) {
+						// Narrated text and tool calls can coexist on one assistant
+						// message; surface the text first, then the tool calls.
+						if (!sawText) {
+							const text = assistantText(message);
+							if (text) {
+								sawText = true;
+								yield { type: "text", delta: text };
+							}
+						}
+						// Record the tool_use ids in handler-invocation order and surface
+						// them to Hermes. The MCP handlers are now blocking on these ids;
+						// the server keeps this generator alive and resumes it when
+						// Hermes returns the results.
+						const calls = recordToolUses(toolBridge, toolUses as Array<{ id: string; name: string; input?: unknown }>);
+						if (calls.length > 0) {
+							yield { type: "tool_call", calls };
+						}
+						continue;
+					}
 				}
 				if (!sawText) {
 					const text = assistantText(message);

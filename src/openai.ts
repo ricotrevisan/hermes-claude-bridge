@@ -105,6 +105,27 @@ export function reasoningChunk(id: string, created: number, model: string, reaso
 	return chunk(id, created, model, deltaChoice({ reasoning_content: reasoning }, null));
 }
 
+/**
+ * Stream tool calls. Each call is delivered in a single delta carrying its
+ * full id, name, and serialized arguments. Hermes' streaming consumer accepts
+ * a whole-arguments delta (it accumulates arguments with +=, so one complete
+ * delta is equivalent to many partial ones) and keys slots by index.
+ */
+export function toolCallChunk(
+	id: string,
+	created: number,
+	model: string,
+	calls: Array<{ index: number; id: string; name: string; arguments: string }>,
+) {
+	const toolCalls = calls.map((call) => ({
+		index: call.index,
+		id: call.id,
+		type: "function",
+		function: { name: call.name, arguments: call.arguments },
+	}));
+	return chunk(id, created, model, [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }]);
+}
+
 /** Terminating content chunk: carries finish_reason with an empty delta. */
 export function finishChunk(
 	id: string,
@@ -136,5 +157,32 @@ export function completion(
 		model,
 		choices: [{ index: 0, message, finish_reason: opts.finishReason }],
 		usage: opts.usage,
+	};
+}
+
+/** Non-streaming response carrying tool calls for Hermes to execute. */
+export function completionWithToolCalls(
+	id: string,
+	created: number,
+	model: string,
+	opts: { content: string; reasoning?: string; toolCalls: Array<{ id: string; name: string; arguments: string }> },
+): Record<string, unknown> {
+	const message: Record<string, unknown> = {
+		role: "assistant",
+		content: opts.content || null,
+		tool_calls: opts.toolCalls.map((call) => ({
+			id: call.id,
+			type: "function",
+			function: { name: call.name, arguments: call.arguments },
+		})),
+	};
+	if (opts.reasoning) message.reasoning_content = opts.reasoning;
+	return {
+		id,
+		object: "chat.completion",
+		created,
+		model,
+		choices: [{ index: 0, message, finish_reason: "tool_calls" }],
+		usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
 	};
 }

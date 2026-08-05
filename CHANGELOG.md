@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format is based on
 
 ## Unreleased
 
+## [0.3.0] - 2026-08-05
+
+- **Hermes tool bridging (issue #1).** When Hermes sends `tools` in its request, the
+  bridge exposes those exact schemas to Claude Code through an in-process MCP server
+  (`src/toolbridge.ts`). Claude Code gets no built-in tools; every tool call is surfaced to
+  Hermes as an OpenAI `tool_call` with `finish_reason: "tool_calls"`, Hermes executes it
+  with its own permissions, and the bridge resolves the blocked MCP handler so Claude
+  continues the same turn (`src/coordinator.ts`). The bridge never executes a tool itself.
+  Verified live on openclaw on both streaming and buffered paths on the subscription lane.
+- **Full-agent mode removed.** `CLAUDE_BRIDGE_FULL_AGENT=1` no longer enables Claude Code's
+  bypass-permission built-in tools; tool mode supersedes it with a strictly smaller attack
+  surface. The env var is ignored (regression-tested).
+- **Agent SDK 0.2.141 → 0.3.220** (exact pin kept), plus direct deps `zod` and
+  `@modelcontextprotocol/sdk` for the MCP server. The newer bundled Claude Code also
+  refreshes genuinely-expired OAuth tokens that 0.2.141's bundled CLI wedged on.
+
 - Clarified the provider wording: the picker row and install output no longer say "no API
   key" right before Hermes' setup flow shows one — they now explain that the detected key is
   the installer's auto-managed local bearer token (keep it), not an Anthropic API key.

@@ -285,3 +285,155 @@ test("header and body reads are bounded so a stalled client cannot hold a connec
 	assert.ok(server.headersTimeout > 0);
 	assert.ok(server.requestTimeout > 0 && server.requestTimeout > server.headersTimeout);
 });
+
+test("streaming tool-call round-trip: request #1 ends with tool_calls, request #2 resumes the same query", async () => {
+	// The runner simulates a query that emits one tool call, then — once the
+	// MCP handler resolves — the final answer. The state flows through the
+	// server's coordinator: the tool_call event is recorded, request #2's tool
+	// results are delivered, and the generator is resumed into response #2.
+	const events: BridgeEvent[] = [];
+	let released = 0;
+
+	const runner: BridgeRunner = (async function* (messages: unknown, options: any) {
+		const state = options.toolBridge;
+		// The real SDK records the tool_use, then asynchronously invokes the MCP
+		// handler (which blocks). Simulate that: register a blocked handler in
+		// pendingToolCalls before yielding the tool_call event.
+		state.turnToolCallIds.push("toolu_1");
+		let handlerSettled: () => void = () => {};
+		const handlerDone = new Promise<void>((resolve) => { handlerSettled = resolve; });
+		void (async () => {
+			const entry: any = { toolName: "echo", resolve: (r: unknown) => { void r; } };
+			await new Promise<void>((resolve) => {
+				entry.resolve = (result: unknown) => { void result; handlerSettled(); };
+				state.pendingToolCalls.set("toolu_1", entry);
+				resolve();
+			});
+		})();
+		yield {
+			type: "tool_call",
+			calls: [{ id: "toolu_1", name: "echo", arguments: "{}" }],
+		};
+		// Block until the coordinator delivers the result (resolves the handler).
+		await handlerDone;
+		yield { type: "text", delta: "The result was echoed: hi" };
+		yield { type: "usage", usage: { input_tokens: 10, output_tokens: 5 } };
+		yield { type: "done", stopReason: "end_turn" };
+	}) as BridgeRunner;
+
+	const server = createBridgeServer(runner, TOKEN);
+	server.listen(0, "127.0.0.1");
+	await once(server, "listening");
+	const port = (server.address() as AddressInfo).port;
+	const baseUrl = `http://127.0.0.1:${port}`;
+	try {
+		// Request #1: stream=true, tools declared, no tool results yet.
+		const resp1 = await fetch(`${baseUrl}/v1/chat/completions`, {
+			method: "POST",
+			headers: authHeaders,
+			body: JSON.stringify({
+				model: "fable",
+				stream: true,
+				tools: [{ type: "function", function: { name: "echo", description: "e", parameters: { type: "object", properties: {} } } }],
+				messages: [{ role: "user", content: "call echo" }],
+			}),
+		});
+		assert.equal(resp1.status, 200);
+		const text1 = await resp1.text();
+		const payloads1 = text1
+			.trim()
+			.split("\n\n")
+			.filter((f) => f.startsWith("data: ") && f !== "data: [DONE]")
+			.map((f) => JSON.parse(f.replace(/^data: /, "")));
+		// role chunk + tool_calls chunk + finish chunk
+		const toolFrame = payloads1.find((p) => p.choices?.[0]?.delta?.tool_calls);
+		assert.ok(toolFrame, "expected a tool_calls delta frame");
+		assert.equal(toolFrame.choices[0].delta.tool_calls[0].id, "toolu_1");
+		assert.equal(toolFrame.choices[0].delta.tool_calls[0].function.name, "echo");
+		const finishFrame = payloads1.find((p) => p.choices?.[0]?.finish_reason);
+		assert.equal(finishFrame.choices[0].finish_reason, "tool_calls");
+
+		// Request #2: tool result with matching tool_call_id → continuation.
+		const resp2 = await fetch(`${baseUrl}/v1/chat/completions`, {
+			method: "POST",
+			headers: authHeaders,
+			body: JSON.stringify({
+				model: "fable",
+				stream: true,
+				messages: [
+					{ role: "user", content: "call echo" },
+					{ role: "assistant", content: null, tool_calls: [{ id: "toolu_1", type: "function", function: { name: "echo", arguments: "{}" } }] },
+					{ role: "tool", tool_call_id: "toolu_1", content: "echoed: hi" },
+				],
+			}),
+		});
+		assert.equal(resp2.status, 200);
+		const text2 = await resp2.text();
+		const payloads2 = text2
+			.trim()
+			.split("\n\n")
+			.filter((f) => f.startsWith("data: ") && f !== "data: [DONE]")
+			.map((f) => JSON.parse(f.replace(/^data: /, "")));
+		assert.ok(payloads2.some((p) => p.choices?.[0]?.delta?.content === "The result was echoed: hi"));
+		const finish2 = payloads2.find((p) => p.choices?.[0]?.finish_reason);
+		assert.equal(finish2.choices[0].finish_reason, "stop");
+	} finally {
+		server.close();
+		await once(server, "close");
+	}
+});
+
+test("buffered tool-call round-trip: response #1 returns tool_calls, response #2 completes", async () => {
+	const runner: BridgeRunner = (async function* (messages: unknown, options: any) {
+		const state = options.toolBridge;
+		state.turnToolCallIds.push("toolu_1");
+		let handlerSettled: () => void = () => {};
+		const handlerDone = new Promise<void>((resolve) => { handlerSettled = resolve; });
+		state.pendingToolCalls.set("toolu_1", {
+			toolName: "echo",
+			resolve: () => handlerSettled(),
+		} as any);
+		yield { type: "tool_call", calls: [{ id: "toolu_1", name: "echo", arguments: "{}" }] };
+		await handlerDone;
+		yield { type: "text", delta: "done" };
+		yield { type: "usage", usage: { input_tokens: 4, output_tokens: 2 } };
+		yield { type: "done", stopReason: "end_turn" };
+	}) as BridgeRunner;
+
+	const server = createBridgeServer(runner, TOKEN);
+	server.listen(0, "127.0.0.1");
+	await once(server, "listening");
+	const port = (server.address() as AddressInfo).port;
+	const baseUrl = `http://127.0.0.1:${port}`;
+	try {
+		const body1 = {
+			model: "fable",
+			tools: [{ type: "function", function: { name: "echo", description: "e", parameters: { type: "object", properties: {} } } }],
+			messages: [{ role: "user", content: "call echo" }],
+		};
+		const resp1 = await fetch(`${baseUrl}/v1/chat/completions`, { method: "POST", headers: authHeaders, body: JSON.stringify(body1) });
+		assert.equal(resp1.status, 200);
+		const json1: any = await resp1.json();
+		assert.equal(json1.choices[0].finish_reason, "tool_calls");
+		assert.equal(json1.choices[0].message.tool_calls[0].id, "toolu_1");
+		assert.equal(json1.choices[0].message.tool_calls[0].function.name, "echo");
+		assert.equal(json1.choices[0].message.content, null);
+
+		const body2 = {
+			model: "fable",
+			messages: [
+				{ role: "user", content: "call echo" },
+				{ role: "assistant", content: null, tool_calls: [{ id: "toolu_1", type: "function", function: { name: "echo", arguments: "{}" } }] },
+				{ role: "tool", tool_call_id: "toolu_1", content: "echoed: hi" },
+			],
+		};
+		const resp2 = await fetch(`${baseUrl}/v1/chat/completions`, { method: "POST", headers: authHeaders, body: JSON.stringify(body2) });
+		assert.equal(resp2.status, 200);
+		const json2: any = await resp2.json();
+		assert.equal(json2.choices[0].message.content, "done");
+		assert.equal(json2.choices[0].finish_reason, "stop");
+	} finally {
+		server.close();
+		await once(server, "close");
+	}
+});

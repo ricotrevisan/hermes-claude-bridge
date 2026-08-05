@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import { runClaude, describeError, type BridgeEvent } from "./bridge.js";
 import {
 	completion,
+	completionWithToolCalls,
 	contentChunk,
 	finishChunk,
 	mapStopReason,
@@ -27,12 +28,15 @@ import {
 	roleChunk,
 	sseFrame,
 	SSE_DONE,
+	toolCallChunk,
 	usageChunk,
 	type AnthropicUsage,
 	type OpenAIFinishReason,
 } from "./openai.js";
 import type { OpenAIMessage } from "./convert.js";
 import { expectedContextWindow, MODEL_IDS, resolveModel, runtimeModelId } from "./models.js";
+import { extractToolResults, newToolBridgeState, ToolCallCoordinator, type PendingQuery } from "./coordinator.js";
+import type { HermesToolDef, ToolCallInvocation } from "./toolbridge.js";
 
 // Injected by esbuild at build time; absent when running from source.
 declare const __BRIDGE_VERSION__: string;
@@ -128,7 +132,12 @@ function validateMessages(messages: unknown[]): string | null {
 	return null;
 }
 
-async function handleChatCompletion(req: IncomingMessage, res: ServerResponse, runner: BridgeRunner): Promise<void> {
+async function handleChatCompletion(
+	req: IncomingMessage,
+	res: ServerResponse,
+	runner: BridgeRunner,
+	coordinator: ToolCallCoordinator,
+): Promise<void> {
 	if (req.headers.origin) {
 		sendError(res, 403, "browser-origin requests are not allowed", "forbidden");
 		return;
@@ -178,6 +187,36 @@ async function handleChatCompletion(req: IncomingMessage, res: ServerResponse, r
 		sendError(res, 400, "`reasoning_effort` must be a string", "invalid_request_error");
 		return;
 	}
+	const tools = parseTools(parsed?.tools);
+
+	// A continuation request carries tool results whose tool_call_ids match
+	// calls we emitted earlier. Deliver those results to the still-blocked MCP
+	// handlers and resume the SAME query generator into this response.
+	const toolResults = extractToolResults(messages);
+	const resumedQueries =
+		toolResults.length > 0 && toolResults.some((r) => coordinator.hasPending(r.toolCallId))
+			? coordinator.deliverResults(toolResults)
+			: [];
+
+	if (resumedQueries.length > 0) {
+		// Continuation: the underlying query is owned by the coordinator. The
+		// new response's abort must reach that same query.
+		const query = resumedQueries[0];
+		const ac = new AbortController();
+		res.on("close", () => {
+			if (!res.writableEnded) {
+				query.abort();
+			}
+		});
+		const events = query.generator;
+		const completed = stream
+			? await streamResponse(res, events, model, coordinator, query.queryId, query)
+			: await bufferResponse(res, events, model, coordinator, query.queryId, query);
+		// Query completed (done/error) — no longer needed. If it paused at
+		// another tool_call, keep it registered for the next continuation.
+		if (completed) coordinator.releaseQuery(query.queryId);
+		return;
+	}
 
 	// Client disconnect → abort the underlying query.
 	const ac = new AbortController();
@@ -185,19 +224,42 @@ async function handleChatCompletion(req: IncomingMessage, res: ServerResponse, r
 		if (!res.writableEnded) ac.abort();
 	});
 
-	const events = runner(messages, { model: runtimeModelId(model), reasoning, signal: ac.signal });
-	if (stream) {
-		await streamResponse(res, events, model);
-	} else {
-		await bufferResponse(res, events, model);
-	}
+	// Fresh turn. Register the query with the coordinator so a later request
+	// can deliver tool results to it across the HTTP boundary.
+	const state = newToolBridgeState();
+	const queryId = crypto.randomUUID();
+	const events = runner(messages, {
+		model: runtimeModelId(model),
+		reasoning,
+		signal: ac.signal,
+		...(tools ? { tools } : {}),
+		toolBridge: state,
+	});
+	coordinator.registerQuery({
+		queryId,
+		generator: events,
+		state,
+		abort: () => ac.abort(),
+		lastSeen: Date.now(),
+	});
+
+	// The query stays registered while a tool-call round-trip is pending: only
+	// a terminal event (done/error) or an abort releases it. streamResponse /
+	// bufferResponse report whether the turn completed.
+	const completed = stream
+		? await streamResponse(res, events, model, coordinator, queryId, undefined)
+		: await bufferResponse(res, events, model, coordinator, queryId, undefined);
+	if (completed) coordinator.releaseQuery(queryId);
 }
 
 async function streamResponse(
 	res: ServerResponse,
 	events: AsyncGenerator<BridgeEvent>,
 	model: string,
-): Promise<void> {
+	coordinator: ToolCallCoordinator,
+	queryId: string,
+	query: PendingQuery | undefined,
+): Promise<boolean> {
 	const id = newId();
 	const created = nowSeconds();
 	let headersSent = false;
@@ -224,58 +286,80 @@ async function streamResponse(
 		res.end();
 	};
 
-	try {
-		for await (const ev of events) {
-			switch (ev.type) {
-				case "text":
-					if (!headersSent) startStream();
-					res.write(sseFrame(contentChunk(id, created, model, ev.delta)));
-					break;
-				case "reasoning":
-					if (!headersSent) startStream();
-					res.write(sseFrame(reasoningChunk(id, created, model, ev.delta)));
-					break;
-				case "usage":
-					usage = ev.usage;
-					break;
-				case "done":
-					stopReason = ev.stopReason;
-					if (!headersSent) startStream();
-					finish(mapStopReason(stopReason));
-					return;
-				case "error": {
-					const msg = describeError(ev.message, ev.status);
-					if (!headersSent) {
-						sendError(res, errorHttpStatus(ev), msg, "upstream_error");
-						return;
-					}
+	const emitToolCalls = (calls: ToolCallInvocation[]) => {
+		// Record each call so a later request can deliver its result. The MCP
+		// handlers are already blocked; the query stays alive after this response.
+		for (const call of calls) coordinator.recordCall(queryId, call.id, call.name);
+		if (!headersSent) startStream();
+		res.write(
+			sseFrame(toolCallChunk(id, created, model, calls.map((call, index) => ({ index, ...call })))),
+		);
+		res.write(sseFrame(finishChunk(id, created, model, "tool_calls")));
+		res.write(SSE_DONE);
+		res.end();
+	};
+
+	// Manual iteration: ending a tool-call response must NOT close the
+	// generator, because the query it drives is still alive and will be
+	// resumed by a later request. for-await would return() it on break.
+	const iterator = events[Symbol.asyncIterator]();
+	while (true) {
+		const { value, done } = await iterator.next();
+		if (done) break;
+		const ev = value;
+		switch (ev.type) {
+			case "text":
+				if (!headersSent) startStream();
+				res.write(sseFrame(contentChunk(id, created, model, ev.delta)));
+				break;
+			case "reasoning":
+				if (!headersSent) startStream();
+				res.write(sseFrame(reasoningChunk(id, created, model, ev.delta)));
+				break;
+			case "usage":
+				usage = ev.usage;
+				break;
+			case "done":
+				stopReason = ev.stopReason;
+				if (!headersSent) startStream();
+				finish(mapStopReason(stopReason));
+				await iterator.return?.(undefined);
+				return true;
+			case "tool_call":
+				// End this response with finish_reason "tool_calls" and keep the
+				// generator alive for the continuation request.
+				emitToolCalls(ev.calls);
+				return false;
+			case "error": {
+				const msg = describeError(ev.message, ev.status);
+				if (!headersSent) {
+					sendError(res, errorHttpStatus(ev), msg, "upstream_error");
+				} else {
 					// Mid-stream failure: surface the error as content, then finish
 					// cleanly so Hermes doesn't treat it as a malformed SSE retry.
 					res.write(sseFrame(contentChunk(id, created, model, `\n\n[bridge error] ${msg}`)));
 					finish("stop");
-					return;
 				}
+				await iterator.return?.(undefined);
+				return true;
 			}
 		}
-		// Generator ended without an explicit done (shouldn't happen) — close cleanly.
-		if (!headersSent) startStream();
-		finish(mapStopReason(stopReason));
-	} catch (err) {
-		const msg = err instanceof Error ? err.message : String(err);
-		if (!headersSent) {
-			sendError(res, 502, describeError(msg), "upstream_error");
-		} else {
-			res.write(sseFrame(contentChunk(id, created, model, `\n\n[bridge error] ${msg}`)));
-			finish("stop");
-		}
 	}
+	// Generator ended without an explicit done (shouldn't happen) — close cleanly.
+	if (!headersSent) startStream();
+	finish(mapStopReason(stopReason));
+	await iterator.return?.(undefined);
+	return true;
 }
 
 async function bufferResponse(
 	res: ServerResponse,
 	events: AsyncGenerator<BridgeEvent>,
 	model: string,
-): Promise<void> {
+	coordinator: ToolCallCoordinator,
+	queryId: string,
+	query: PendingQuery | undefined,
+): Promise<boolean> {
 	const id = newId();
 	const created = nowSeconds();
 	let content = "";
@@ -284,9 +368,14 @@ async function bufferResponse(
 	let stopReason: string | null = null;
 	let errorMessage: string | null = null;
 	let errorStatus = 502;
+	let pausedAtToolCall = false;
 
 	try {
-		for await (const ev of events) {
+		const iterator = events[Symbol.asyncIterator]();
+		while (true) {
+			const { value, done } = await iterator.next();
+			if (done) break;
+			const ev = value;
 			switch (ev.type) {
 				case "text":
 					content += ev.delta;
@@ -300,6 +389,22 @@ async function bufferResponse(
 				case "done":
 					stopReason = ev.stopReason;
 					break;
+				case "tool_call": {
+					// Record each call and return a tool_calls response. The query
+					// generator stays alive for the continuation request.
+					for (const call of ev.calls) coordinator.recordCall(queryId, call.id, call.name);
+					pausedAtToolCall = true;
+					sendJson(
+						res,
+						200,
+						completionWithToolCalls(id, created, model, {
+							content,
+							reasoning: reasoning || undefined,
+							toolCalls: ev.calls,
+						}),
+					);
+					return false;
+				}
 				case "error":
 					errorMessage = describeError(ev.message, ev.status);
 					errorStatus = errorHttpStatus(ev);
@@ -312,7 +417,7 @@ async function bufferResponse(
 
 	if (errorMessage) {
 		sendError(res, errorStatus, errorMessage, "upstream_error");
-		return;
+		return true;
 	}
 
 	sendJson(
@@ -325,9 +430,16 @@ async function bufferResponse(
 			usage: mapUsage(usage),
 		}),
 	);
+	return true;
 }
 
-function handler(req: IncomingMessage, res: ServerResponse, runner: BridgeRunner, token: string): void {
+function handler(
+	req: IncomingMessage,
+	res: ServerResponse,
+	runner: BridgeRunner,
+	token: string,
+	coordinator: ToolCallCoordinator,
+): void {
 	const url = (req.url ?? "").split("?")[0];
 	const method = req.method ?? "GET";
 
@@ -346,7 +458,7 @@ function handler(req: IncomingMessage, res: ServerResponse, runner: BridgeRunner
 		return;
 	}
 	if (method === "POST" && (url === "/v1/chat/completions" || url === "/chat/completions")) {
-		void handleChatCompletion(req, res, runner).catch((err) => {
+		void handleChatCompletion(req, res, runner, coordinator).catch((err) => {
 			const msg = err instanceof Error ? err.message : String(err);
 			if (!res.headersSent) sendError(res, 500, msg);
 			else if (!res.writableEnded) res.end();
@@ -357,9 +469,30 @@ function handler(req: IncomingMessage, res: ServerResponse, runner: BridgeRunner
 	sendError(res, 404, `no route for ${method} ${url}`, "not_found");
 }
 
+/** Validate and normalize the OpenAI `tools` array from a request body. */
+function parseTools(tools: unknown): HermesToolDef[] | undefined {
+	if (!Array.isArray(tools)) return undefined;
+	const parsed: HermesToolDef[] = [];
+	for (const tool of tools) {
+		if (!tool || typeof tool !== "object") continue;
+		const fn = (tool as any).function;
+		if (!fn || typeof fn !== "object" || typeof fn.name !== "string" || !fn.name) continue;
+		parsed.push({
+			type: "function",
+			function: {
+				name: fn.name,
+				description: typeof fn.description === "string" ? fn.description : undefined,
+				...(fn.parameters && typeof fn.parameters === "object" ? { parameters: fn.parameters } : {}),
+			},
+		});
+	}
+	return parsed.length > 0 ? parsed : undefined;
+}
+
 export function createBridgeServer(
 	runner: BridgeRunner = runClaude,
 	token = process.env.CLAUDE_BRIDGE_API_KEY,
+	coordinator: ToolCallCoordinator = new ToolCallCoordinator(),
 ): ReturnType<typeof createServer> {
 	if (!token) {
 		throw new Error(
@@ -367,7 +500,7 @@ export function createBridgeServer(
 				"run `hermes-claude-bridge install` to provision a token, or export the one in ~/.hermes/.env.",
 		);
 	}
-	const server = createServer((req, res) => handler(req, res, runner, token));
+	const server = createServer((req, res) => handler(req, res, runner, token, coordinator));
 	// Slow-loris hardening: cap how long a client may take to send headers and
 	// the request body. Neither bounds the (possibly long) SSE response.
 	server.headersTimeout = HEADERS_TIMEOUT_MS;
