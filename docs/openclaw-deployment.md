@@ -1,23 +1,36 @@
 # openclaw deployment context
 
-Operational state of the Hermes host `openclaw` (SSH alias) as of 2026-08-02,
-with the v0.2.0 bridge (commit `acde28a`, post-#10 installer) deployed. See
+Operational state of the Hermes host `openclaw` (SSH alias) as of 2026-08-05,
+with the v0.3.0 bridge (commit `f8718da`, Hermes tool bridging) deployed. See
 `docs/adr/0001-bridge-over-claude-agent-acp.md` for the decision.
 
 ## Current state
 
-- Bridge v0.2.0 deployed 2026-08-02 via the stock installer — no manual steps.
-  Source clone: `~/src/hermes-claude-bridge` (deploy = `git pull && npm install
+- Bridge v0.3.0 deployed 2026-08-05 via the stock installer. Source clone:
+  `~/src/hermes-claude-bridge` (deploy = `git pull && npm install
   && PATH=~/.hermes/node/bin:$PATH node bin/cli.mjs install`; reinstall is
-  idempotent and re-uses the bearer token).
+  idempotent and re-uses the bearer token). **Gotcha:** `dist/` is gitignored,
+  so after pulling new code the local `dist/server.js` may be stale — remove it
+  (`rm dist/server.js`) before `install` so the installer rebuilds, or the
+  health check fails with "port still answers as v0.2.0" against the new
+  version string.
 - Service `hermes-claude-bridge` (systemd --user) on 127.0.0.1:8787; logs at
   `~/.hermes/logs/claude-bridge.log`; `/healthz` reports
-  `{service, version: "0.2.0"}` (the installer asserts both since #10).
-- Verified 2026-08-02: one `hermes -z` turn each on `claude-fable-5` and
-  `claude-opus-5` via `--provider claude-bridge`; no new
-  `request_dump_*.json`, journald clean. Billing: success is proof of the
-  subscription lane — the bridge fails overage turns (src/bridge.ts) and the
-  account has org-level overage disabled.
+  `{service, version: "0.3.0"}`.
+- Verified 2026-08-05: one `hermes -z` turn on `claude-fable-5` via
+  `--provider claude-bridge`; a live tool round-trip through :8787
+  (Claude → `finish_reason: "tool_calls"` → result delivered → Claude answers
+  with it, same turn); no new `request_dump_*.json`, journald clean. Billing:
+  success is proof of the subscription lane — the bridge fails overage turns
+  (src/bridge.ts) and the account has org-level overage disabled.
+- SDK pinned at 0.3.220 (was 0.2.141). The newer bundled Claude Code refreshes
+  genuinely-expired OAuth tokens that 0.2.141's bundled CLI wedged on — the
+  recurring "OAuth access token has expired" 401 that broke turns ~8h after
+  the last login is fixed by this bump alone.
+- Hermes tool bridging ships in 0.3.0: sending `tools` in a completion request
+  exposes those schemas to Claude via an in-process MCP server; the bridge
+  never executes tools (Hermes stays the tool authority). Full-agent mode
+  (`CLAUDE_BRIDGE_FULL_AGENT`) was removed.
 - Known wart: the SDK reports usage under `claude-fable-5[1m]` /
   `claude-opus-5[1m]` keys; the bridge's measured catalog logs "no modelUsage
   entry" drift warnings until the catalog learns the `[1m]` variants.
@@ -39,8 +52,10 @@ with the v0.2.0 bridge (commit `acde28a`, post-#10 installer) deployed. See
   produced a duplicate picker row and `billing_provider: custom` labels.
   `model.provider` is now the plugin slug `claude-bridge`. Backup:
   `config.yaml.bak-optB-20260802-143157`.
-- Active model config: user-switched to `claude-fable-5` / `claude-bridge` on
-  2026-08-02 (previous required default was `gpt-5.6-sol` / `openai-codex`).
+- Active model config: currently `gpt-5.6-sol` / `openai-codex` (Rico switched back
+  after the 0.2.1-era 401 wedge; the bridge is reachable per-session via
+  `/model … --provider claude-bridge` or a `model_override`). Deploying 0.3.0 did
+  not change the default.
 - Backups on openclaw: `~/.hermes/config.yaml.bak-bridge-v020-install-20260802-135118`
   and `.env.bak-bridge-v020-install-20260802-135118` (pre-install), plus the
   older `bak-pre-claude-acp` / `bak-pre-decommission` series.
